@@ -65,6 +65,7 @@ struct _GstInterPipeINodeInterface
   gboolean (* add_listener) (GstInterPipeINode *iface, GstInterPipeIListener * listener);
   gboolean (* remove_listener) (GstInterPipeINode *iface, GstInterPipeIListener * listener);
   gboolean (* receive_event) (GstInterPipeINode *iface, GstEvent *event);
+  gboolean (* receive_query) (GstInterPipeINode *iface, GstQuery *query);
 };
 
 /**
@@ -103,6 +104,22 @@ gboolean gst_inter_pipe_inode_remove_listener (GstInterPipeINode *iface, GstInte
  * Returns: True if the node is able to receive the event, False otherwise.
  */
 gboolean gst_inter_pipe_inode_receive_event (GstInterPipeINode *iface, GstEvent *event);
+
+/**
+ * gst_inter_pipe_inode_receive_query:
+ * @iface: (transfer none)(not nullable): The object implementing the interface.
+ * @query: (transfer none)(not nullable): The #GstQuery to run upstream.
+ *
+ * Given an upstream #GstQuery in @query (typically a #GST_QUERY_CONTEXT
+ * originating below an interpipesrc), run it against the node's own upstream
+ * peer so it can be answered by the producer pipeline. This lets decoupled
+ * pipelines share a hardware context (e.g. a VADisplay) across the interpipe
+ * boundary, the same way events are forwarded with
+ * #gst_inter_pipe_inode_receive_event.
+ *
+ * Returns: True if the query was answered, False otherwise.
+ */
+gboolean gst_inter_pipe_inode_receive_query (GstInterPipeINode *iface, GstQuery *query);
 
 GType gst_inter_pipe_inode_get_type (void);
 

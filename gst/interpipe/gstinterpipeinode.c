@@ -79,3 +79,17 @@ gst_inter_pipe_inode_receive_event (GstInterPipeINode * self, GstEvent * event)
 
   return iface->receive_event (self, event);
 }
+
+gboolean
+gst_inter_pipe_inode_receive_query (GstInterPipeINode * self, GstQuery * query)
+{
+  GstInterPipeINodeInterface *iface;
+
+  g_return_val_if_fail (GST_INTER_PIPE_IS_INODE (self), FALSE);
+  g_return_val_if_fail (query, FALSE);
+
+  iface = GST_INTER_PIPE_INODE_GET_IFACE (self);
+  g_return_val_if_fail (iface->receive_query != NULL, FALSE);
+
+  return iface->receive_query (self, query);
+}

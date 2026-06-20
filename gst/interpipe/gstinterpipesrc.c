@@ -87,11 +87,14 @@ static gboolean gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
 static gboolean gst_inter_pipe_src_push_event (GstInterPipeIListener * iface,
     GstEvent * event, guint64 basetime);
 static gboolean gst_inter_pipe_src_send_eos (GstInterPipeIListener * iface);
+static gboolean gst_inter_pipe_src_push_query (GstInterPipeIListener * iface,
+    GstQuery * query);
 static gboolean gst_inter_pipe_src_listen_node (GstInterPipeSrc * src,
     const gchar * node_name);
 static gboolean gst_inter_pipe_src_start (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_stop (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event);
+static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
 
@@ -225,6 +228,7 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
   basesrc_class->start = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_start);
   basesrc_class->stop = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_stop);
   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_event);
+  basesrc_class->query = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_query);
   basesrc_class->create = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_create);
 }
 
@@ -464,6 +468,37 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
   return basesrc_class->event (base, event);
 }
 
+static gboolean
+gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
+{
+  GstBaseSrcClass *basesrc_class;
+  GstInterPipeSrc *src;
+  GstInterPipeINode *node;
+
+  basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
+  src = GST_INTER_PIPE_SRC (base);
+
+  /* A context query travels upstream looking for a shared element context
+   * (e.g. a VADisplay used for hardware surface/DMABuf coordination). Since an
+   * interpipesrc is the head of its pipeline the query would normally dead-end
+   * here, so forward it across the interpipe boundary to the connected
+   * interpipesink, which runs it against the producer pipeline. This lets
+   * decoupled pipelines share a hardware context the same way their buffers
+   * and events are already shared. Everything else falls through to the
+   * default GstBaseSrc handling. */
+  if (GST_QUERY_TYPE (query) == GST_QUERY_CONTEXT) {
+    node = gst_inter_pipe_get_node (src->listen_to);
+    if (node && gst_inter_pipe_inode_receive_query (node, query)) {
+      GST_DEBUG_OBJECT (src,
+          "Answered %s query across the interpipe boundary",
+          GST_QUERY_TYPE_NAME (query));
+      return TRUE;
+    }
+  }
+
+  return basesrc_class->query (base, query);
+}
+
 static GstFlowReturn
 gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
     GstBuffer ** buf)
@@ -529,6 +564,7 @@ gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface * iface)
   iface->set_caps = gst_inter_pipe_src_set_caps;
   iface->push_buffer = gst_inter_pipe_src_push_buffer;
   iface->push_event = gst_inter_pipe_src_push_event;
+  iface->query = gst_inter_pipe_src_push_query;
   iface->send_eos = gst_inter_pipe_src_send_eos;
 }
 
@@ -765,6 +801,7 @@ no_events:
   }
 }
 
+
 static gboolean
 gst_inter_pipe_src_send_eos (GstInterPipeIListener * iface)
 {
@@ -783,6 +820,33 @@ gst_inter_pipe_src_send_eos (GstInterPipeIListener * iface)
   }
   return TRUE;
 }
+
+
+static gboolean
+gst_inter_pipe_src_push_query (GstInterPipeIListener * iface, GstQuery * query)
+{
+  GstInterPipeSrc *src;
+  GstPad *srcpad;
+  GstPad *peerpad;
+  gboolean ret = TRUE;
+
+  src = GST_INTER_PIPE_SRC (iface);
+  srcpad = GST_INTER_PIPE_SRC_PAD (GST_APP_SRC (src));
+
+  peerpad = gst_pad_get_peer (srcpad);
+  if (!peerpad) {
+    ret = FALSE;
+    goto out;
+  }
+
+  ret = gst_pad_query (peerpad, query);
+
+  gst_object_unref (peerpad);
+
+out:
+  return ret;
+}
+
 
 static gboolean
 gst_inter_pipe_src_listen_node (GstInterPipeSrc * src, const gchar * node_name)
