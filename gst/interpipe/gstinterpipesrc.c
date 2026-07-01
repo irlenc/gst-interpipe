@@ -99,6 +99,8 @@ static gboolean gst_inter_pipe_src_listen_node (GstInterPipeSrc * src,
 static gboolean gst_inter_pipe_src_start (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_stop (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event);
+static GstStateChangeReturn gst_inter_pipe_src_change_state (GstElement *
+    element, GstStateChange transition);
 static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
@@ -146,6 +148,14 @@ struct _GstInterPipeSrc
    * pushed from the node's streaming thread and drained from this element's. */
   GQueue *pending_serial_events;
   GMutex serial_events_lock;
+
+  /* Set on PAUSED->READY so create() stops forwarding serial events downstream
+   * during teardown. The base class already unblocks the appsrc create; this
+   * closes the window where create() has dequeued a buffer and would still push
+   * its serial event into a downstream element that a concurrent pipeline
+   * teardown may be disposing. Atomic: written from the state-change thread,
+   * read on the streaming thread. */
+  gint flushing;
 
   /* Block switch */
   gboolean block_switch;
@@ -242,6 +252,9 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_event);
   basesrc_class->query = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_query);
   basesrc_class->create = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_create);
+
+  element_class->change_state =
+      GST_DEBUG_FUNCPTR (gst_inter_pipe_src_change_state);
 }
 
 static void
@@ -260,6 +273,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->stream_sync = GST_INTER_PIPE_SRC_PASSTHROUGH_TIMESTAMP;
   src->accept_events = TRUE;
   src->accept_eos_event = TRUE;
+  src->flushing = 0;
 }
 
 static void
@@ -508,6 +522,39 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
   return basesrc_class->stop (base);
 }
 
+static GstStateChangeReturn
+gst_inter_pipe_src_change_state (GstElement * element,
+    GstStateChange transition)
+{
+  GstInterPipeSrc *src = GST_INTER_PIPE_SRC (element);
+  GstStateChangeReturn ret;
+
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
+    /* Begin teardown before the base class stops the streaming task: mark the
+     * element flushing so create() stops forwarding serial events downstream,
+     * and drop any queued ones. The base class already unblocks a create()
+     * waiting on the appsrc; this closes the remaining window where create() has
+     * dequeued a buffer and would still push its serial event into a downstream
+     * element that a concurrent pipeline teardown may be disposing. The queue is
+     * cleared under its own lock only (never held across chain-up) so it cannot
+     * invert against create()'s serial_events_lock. */
+    g_atomic_int_set (&src->flushing, 1);
+    g_mutex_lock (&src->serial_events_lock);
+    while (!g_queue_is_empty (src->pending_serial_events))
+      gst_event_unref (g_queue_pop_head (src->pending_serial_events));
+    g_mutex_unlock (&src->serial_events_lock);
+  }
+
+  ret = GST_ELEMENT_CLASS (gst_inter_pipe_src_parent_class)->change_state
+      (element, transition);
+
+  if (transition == GST_STATE_CHANGE_READY_TO_PAUSED)
+    /* Cleared after chain-up so a restarted element forwards events again. */
+    g_atomic_int_set (&src->flushing, 0);
+
+  return ret;
+}
+
 static gboolean
 gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
 {
@@ -629,9 +676,14 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   g_mutex_unlock (&src->serial_events_lock);
 
   if (serial_event) {
-    GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
-        GST_EVENT_TYPE_NAME (serial_event));
-    gst_pad_push_event (srcpad, serial_event);
+    if (g_atomic_int_get (&src->flushing)) {
+      /* Teardown in progress: never push downstream, the target may be gone. */
+      gst_event_unref (serial_event);
+    } else {
+      GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
+          GST_EVENT_TYPE_NAME (serial_event));
+      gst_pad_push_event (srcpad, serial_event);
+    }
   }
 
   return ret;
