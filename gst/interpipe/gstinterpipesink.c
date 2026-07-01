@@ -210,7 +210,12 @@ gst_inter_pipe_sink_init (GstInterPipeSink * sink)
   sink->caps = NULL;
   sink->caps_negotiated = NULL;
   sink->node_name = NULL;
-  sink->listeners = g_hash_table_new (g_direct_hash, g_direct_equal);
+  /* The table owns a ref on each listener while it is registered, so a listener
+   * (interpipesrc) finalized on a scene-teardown thread cannot be freed while
+   * this sink's streaming thread is mid-dispatch to it. Without the ref the
+   * dispatch loop pushes into freed memory under rapid listen-to churn. */
+  sink->listeners = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
+      (GDestroyNotify) gst_object_unref);
   sink->forward_eos = FALSE;
   sink->forward_events = TRUE;
   sink->last_buffer_timestamp = 0;
@@ -1103,7 +1108,7 @@ add_to_list:
   if (g_hash_table_contains (listeners, listener))
     goto already_registered;
 
-  g_hash_table_insert (listeners, (gpointer) listener, (gpointer) listener);
+  g_hash_table_insert (listeners, (gpointer) listener, gst_object_ref (listener));
 
   g_mutex_unlock (&sink->listeners_mutex);
 
