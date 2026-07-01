@@ -1,0 +1,24 @@
+gst/interpipe/gstinterpipesrc.c
+  s_77b04cb28b9664::t_c26d7483ddb12a 525-557
+  s_77b04cb28b9664::t_aba18b54220371 255-257
+  s_77b04cb28b9664::t_bd68d1b5bb121f 152-159
+  s_77b04cb28b9664::t_3500fb059d4e91 679-686
+  s_77b04cb28b9664::t_4f6d97f8fc7595 276
+  s_77b04cb28b9664::t_e6ec9d78d79f43 102-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9aca5c4f46499578eed1cfb2246ecf2af4231483",
+  "prompts": {},
+  "sessions": {
+    "s_77b04cb28b9664": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12876885-8917-49f2-af80-9aa6ea94d46d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
