@@ -1,0 +1,19 @@
+tests/check/gst/test_reconfigure_event.c
+  s_78538802be42a6::t_2b7e9793a7fb58 150,153-159,161-164,175-179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c8ca81187d9a988bd86981ccf86d6c776b71666e",
+  "prompts": {},
+  "sessions": {
+    "s_78538802be42a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "841161a9-c7c1-4462-92cb-37e7b3d7da9b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
