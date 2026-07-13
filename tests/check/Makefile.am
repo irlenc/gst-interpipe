@@ -29,6 +29,7 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_caps_renegotiation \
                  gst/test_context_query \
                  gst/test_cold_attach \
+                 gst/test_force_key_unit_event \
                  gst/test_stream_sync \
                  gst/test_get_caps \
                  gst/test_hot_plug \
@@ -38,7 +39,8 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_out_of_bounds_events \
                  gst/test_out_of_bounds_upstream_events \
                  gst/test_reconfigure_event \
-                 gst/test_set_caps
+                 gst/test_set_caps \
+                 gst/test_videocrop_format
 
 TESTS = $(check_PROGRAMS)
 

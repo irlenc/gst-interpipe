@@ -6,6 +6,7 @@ core_tests = [
   [ 'gst/test_caps_renegotiation.c' ],
   [ 'gst/test_context_query.c' ],
   [ 'gst/test_cold_attach.c' ],
+  [ 'gst/test_force_key_unit_event.c' ],
   [ 'gst/test_stream_sync.c' ],
   [ 'gst/test_get_caps.c' ],
   [ 'gst/test_hot_plug.c' ],
@@ -16,6 +17,7 @@ core_tests = [
   [ 'gst/test_out_of_bounds_upstream_events.c' ],
   [ 'gst/test_reconfigure_event.c' ],
   [ 'gst/test_set_caps.c' ],
+  [ 'gst/test_videocrop_format.c' ],
 ]
 
 # Add C Definitions for tests
