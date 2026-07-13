@@ -936,13 +936,12 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
   GstInterPipeSink *sink;
   GstBuffer *buffer;
   GstCaps *caps;
-  guint64 basetime;
   gchar *listener_name;
-  gpointer *data_array = user_data;
+  struct PushSampleCtx *ctx = user_data;
 
-  sink = GST_INTER_PIPE_SINK (data_array[0]);
-  buffer = gst_buffer_ref (GST_BUFFER (data_array[1]));
-  caps = (GstCaps *) data_array[2];
+  sink = ctx->sink;
+  buffer = gst_buffer_ref (ctx->buffer);
+  caps = ctx->caps;
 
   listener = GST_INTER_PIPE_ILISTENER (data);
   listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
@@ -966,8 +965,7 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
 
   GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", buffer, listener_name);
 
-  basetime = gst_element_get_base_time (GST_ELEMENT (sink));
-  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, basetime))
+  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, ctx->basetime))
     GST_DEBUG_OBJECT (sink, "Listener %s did not accept the buffer",
         listener_name);
 }
@@ -977,7 +975,7 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
 {
   GHashTable *listeners;
   GstBuffer *buffer;
-  gpointer data[3];
+  struct PushSampleCtx ctx;
 
   g_mutex_lock (&sink->listeners_mutex);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
@@ -996,12 +994,13 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
   GST_LOG_OBJECT (sink, "Received new buffer %p on node %s", buffer,
       sink->node_name);
 
-  data[0] = sink;
-  data[1] = buffer;
+  ctx.sink = sink;
+  ctx.buffer = buffer;
   /* Sample carries the negotiated caps; push_to_listener uses them to set caps
    * on any listener that attached before this node had caps. */
-  data[2] = gst_sample_get_caps (sample);
-  g_hash_table_foreach (listeners, gst_inter_pipe_sink_push_to_listener, data);
+  ctx.caps = gst_sample_get_caps (sample);
+  ctx.basetime = gst_element_get_base_time (GST_ELEMENT (sink));
+  g_hash_table_foreach (listeners, gst_inter_pipe_sink_push_to_listener, &ctx);
   gst_sample_unref (sample);
 
   g_mutex_unlock (&sink->listeners_mutex);
