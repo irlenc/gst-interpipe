@@ -1,0 +1,32 @@
+gst/interpipe/Makefile.am
+  s_78538802be42a6::t_7cfe6958b3bbd4 14-15,17-18
+gst/interpipe/meson.build
+  s_78538802be42a6::t_fb565018f883b2 26
+  s_78538802be42a6::t_bcd2aa42105f17 33
+gst/interpipe/gstinterpipesink.c
+  s_78538802be42a6::t_c280f2ab7670c0 46
+  s_78538802be42a6::t_f8558eb59eab0e 93
+  s_78538802be42a6::t_ab9413b353cfbe 921-930
+  s_78538802be42a6::t_056e596572cf8c 760-761,766-767
+  s_78538802be42a6::t_ae6281804fbc12 881-914
+  s_78538802be42a6::t_15addbd79fe0ac 786-804
+  s_78538802be42a6::t_ccd5b6f89b0419 785
+meson.build
+  s_78538802be42a6::t_872e14379eeded 20-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "87bf820b50ea05cac2a4e4f77cda3e05740f169c",
+  "prompts": {},
+  "sessions": {
+    "s_78538802be42a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "841161a9-c7c1-4462-92cb-37e7b3d7da9b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
