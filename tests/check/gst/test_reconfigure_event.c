@@ -147,11 +147,21 @@ GST_START_TEST (reconfigure_event)
       gst_element_get_state (GST_ELEMENT (sink2), NULL, NULL,
           GST_CLOCK_TIME_NONE));
 
-  /* 
+  /*
    * Verifies if interpipesink and interpipesrc have caps set
    * Reconfigure event is omited when an interpipe sink has two listeners,
-   * that's why sources have to listen to NULL first
+   * that's why sources have to listen to NULL first.
+   *
+   * Clear the flag before triggering the relisten. set_caps emits notify::caps
+   * synchronously on this thread, so clearing it afterwards would discard the
+   * very signal being waited for and stall until the timeout. Holding the mutex
+   * across g_object_set is not an option either: it would deadlock against the
+   * notify handler.
    */
+  g_mutex_lock (&mutex);
+  capschange = FALSE;
+  g_mutex_unlock (&mutex);
+
   g_object_set (G_OBJECT (intersrc1), "listen-to", NULL, NULL);
   g_object_set (G_OBJECT (intersrc2), "listen-to", NULL, NULL);
   g_object_set (G_OBJECT (intersrc1), "listen-to", "intersink2", NULL);
@@ -159,12 +169,14 @@ GST_START_TEST (reconfigure_event)
 
   /* wait for the caps signal */
   g_mutex_lock (&mutex);
-  capschange = FALSE;
   end_time = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
   while (!capschange) {
     if (!g_cond_wait_until (&cond, &mutex, end_time)) {
-      // timeout has passed.
-      g_mutex_unlock (&mutex);
+      /* Timed out. g_cond_wait_until returns with the mutex still held, so
+       * break and let the single unlock below release it. Unlocking here and
+       * looping would re-enter g_cond_wait_until on an unlocked mutex, which
+       * aborts with "unlock mutex that was not locked". */
+      break;
     }
   }
   g_mutex_unlock (&mutex);
