@@ -43,6 +43,7 @@
 #endif
 
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 #include "gstinterpipesink.h"
 #include "gstinterpipeinode.h"
@@ -89,6 +90,7 @@ static gboolean gst_inter_pipe_sink_event (GstBaseSink * base,
     GstEvent * event);
 static gboolean gst_inter_pipe_sink_propose_allocation (GstBaseSink * base,
     GstQuery * query);
+static gboolean gst_inter_pipe_sink_query_is_raw_video (GstQuery * query);
 static gboolean gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink *
     sink, GstCaps * listener_caps, GstCaps * sinkcaps);
 static GstCaps *gst_inter_pipe_sink_caps_intersect (GstCaps * caps1,
@@ -755,12 +757,14 @@ gst_inter_pipe_sink_forward_query_allocation (gpointer key, gpointer data,
   }
 
   /* Finally, cleanup metas from the stored query that aren't support on this
-   * listener. */
+   * listener. GST_VIDEO_META_API_TYPE is exempt from the intersection; see the
+   * note in gst_inter_pipe_sink_propose_allocation. */
   count = gst_query_get_n_allocation_metas (ctx->query);
   for (i = 0; i < count;) {
     GType api = gst_query_parse_nth_allocation_meta (ctx->query, i, NULL);
 
-    if (!gst_query_find_allocation_meta (query, api, NULL)) {
+    if (api != GST_VIDEO_META_API_TYPE
+        && !gst_query_find_allocation_meta (query, api, NULL)) {
       GST_DEBUG_OBJECT (sink, "Dropping allocation meta %s", g_type_name (api));
       gst_query_remove_nth_allocation_meta (ctx->query, i);
       count--;
@@ -776,6 +780,26 @@ gst_inter_pipe_sink_forward_query_allocation (gpointer key, gpointer data,
 out:
   gst_query_unref (query);
   return ret;
+}
+
+static gboolean
+gst_inter_pipe_sink_query_is_raw_video (GstQuery * query)
+{
+  GstCaps *caps = NULL;
+  guint i, count;
+
+  gst_query_parse_allocation (query, &caps, NULL);
+  if (!caps)
+    return FALSE;
+
+  count = gst_caps_get_size (caps);
+  for (i = 0; i < count; i++) {
+    if (gst_structure_has_name (gst_caps_get_structure (caps, i),
+            "video/x-raw"))
+      return TRUE;
+  }
+
+  return FALSE;
 }
 
 static gboolean
@@ -854,12 +878,56 @@ gst_inter_pipe_sink_propose_allocation (GstBaseSink * base, GstQuery * query)
     }
   }
 
+  /* GstVideoMeta describes how the buffer is laid out. It is not a capability a
+   * consumer opts into, and it is deliberately kept out of the aggregation
+   * above (both the per-listener intersection and the wipe on a failed
+   * listener), for four reasons:
+   *
+   * - The sink fans one buffer out to every listener by reference, so all of
+   *   them see a single memory layout. There is no way to hand one listener a
+   *   video-meta buffer and another a default-stride copy, so the aggregated
+   *   answer was never a per-listener promise about layout.
+   * - The listener set is dynamic: listen-to flips at runtime and listeners
+   *   attach long after the producer has negotiated its pool. Whatever is
+   *   intersected at query time does not bind those listeners anyway.
+   * - Answering without the meta is expensive, not neutral. A VA producer that
+   *   finds no GstVideoMeta in the query allocates a second pool and CPU
+   *   downloads every frame into default strides (gstvacompositor.c and
+   *   gstvabasetransform.c: copy_frames = !has_videometa &&
+   *   gst_va_pool_requires_video_meta (pool) && gst_caps_is_raw (caps)). One
+   *   listener that does not advertise the meta therefore imposes a full frame
+   *   GPU to CPU download on every other consumer of the node, silently.
+   * - interpipesink is an appsink: it forwards buffers by reference and never
+   *   maps them, so it accepts the meta unconditionally.
+   *
+   * The consumer this can hurt is one that maps raw video by hand using the
+   * default GstVideoInfo strides instead of gst_video_frame_map. Anything built
+   * on GStreamer's video base classes reads the meta and is correct either way.
+   */
+  if (gst_inter_pipe_sink_query_is_raw_video (query)
+      && !gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE,
+          NULL)) {
+    GST_DEBUG_OBJECT (sink, "Offering %s on raw video caps",
+        g_type_name (GST_VIDEO_META_API_TYPE));
+    gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+  }
+
   g_mutex_unlock (&sink->listeners_mutex);
 
   return ret;
 }
 
 /* Appsink Callbacks */
+struct PushSampleCtx
+{
+  GstInterPipeSink *sink;
+  GstBuffer *buffer;
+  GstCaps *caps;
+  /* Read once per sample: it is the same for every listener in the fan-out and
+   * reading it takes the sink's object lock. */
+  guint64 basetime;
+};
+
 static void
 gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
     gpointer user_data)
