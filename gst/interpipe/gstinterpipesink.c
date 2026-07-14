@@ -43,6 +43,7 @@
 #endif
 
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 #include "gstinterpipesink.h"
 #include "gstinterpipeinode.h"
@@ -89,6 +90,7 @@ static gboolean gst_inter_pipe_sink_event (GstBaseSink * base,
     GstEvent * event);
 static gboolean gst_inter_pipe_sink_propose_allocation (GstBaseSink * base,
     GstQuery * query);
+static gboolean gst_inter_pipe_sink_query_is_raw_video (GstQuery * query);
 static gboolean gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink *
     sink, GstCaps * listener_caps, GstCaps * sinkcaps);
 static GstCaps *gst_inter_pipe_sink_caps_intersect (GstCaps * caps1,
@@ -755,12 +757,14 @@ gst_inter_pipe_sink_forward_query_allocation (gpointer key, gpointer data,
   }
 
   /* Finally, cleanup metas from the stored query that aren't support on this
-   * listener. */
+   * listener. GST_VIDEO_META_API_TYPE is exempt from the intersection; see the
+   * note in gst_inter_pipe_sink_propose_allocation. */
   count = gst_query_get_n_allocation_metas (ctx->query);
   for (i = 0; i < count;) {
     GType api = gst_query_parse_nth_allocation_meta (ctx->query, i, NULL);
 
-    if (!gst_query_find_allocation_meta (query, api, NULL)) {
+    if (api != GST_VIDEO_META_API_TYPE
+        && !gst_query_find_allocation_meta (query, api, NULL)) {
       GST_DEBUG_OBJECT (sink, "Dropping allocation meta %s", g_type_name (api));
       gst_query_remove_nth_allocation_meta (ctx->query, i);
       count--;
@@ -776,6 +780,26 @@ gst_inter_pipe_sink_forward_query_allocation (gpointer key, gpointer data,
 out:
   gst_query_unref (query);
   return ret;
+}
+
+static gboolean
+gst_inter_pipe_sink_query_is_raw_video (GstQuery * query)
+{
+  GstCaps *caps = NULL;
+  guint i, count;
+
+  gst_query_parse_allocation (query, &caps, NULL);
+  if (!caps)
+    return FALSE;
+
+  count = gst_caps_get_size (caps);
+  for (i = 0; i < count; i++) {
+    if (gst_structure_has_name (gst_caps_get_structure (caps, i),
+            "video/x-raw"))
+      return TRUE;
+  }
+
+  return FALSE;
 }
 
 static gboolean
@@ -854,12 +878,56 @@ gst_inter_pipe_sink_propose_allocation (GstBaseSink * base, GstQuery * query)
     }
   }
 
+  /* GstVideoMeta describes how the buffer is laid out. It is not a capability a
+   * consumer opts into, and it is deliberately kept out of the aggregation
+   * above (both the per-listener intersection and the wipe on a failed
+   * listener), for four reasons:
+   *
+   * - The sink fans one buffer out to every listener by reference, so all of
+   *   them see a single memory layout. There is no way to hand one listener a
+   *   video-meta buffer and another a default-stride copy, so the aggregated
+   *   answer was never a per-listener promise about layout.
+   * - The listener set is dynamic: listen-to flips at runtime and listeners
+   *   attach long after the producer has negotiated its pool. Whatever is
+   *   intersected at query time does not bind those listeners anyway.
+   * - Answering without the meta is expensive, not neutral. A VA producer that
+   *   finds no GstVideoMeta in the query allocates a second pool and CPU
+   *   downloads every frame into default strides (gstvacompositor.c and
+   *   gstvabasetransform.c: copy_frames = !has_videometa &&
+   *   gst_va_pool_requires_video_meta (pool) && gst_caps_is_raw (caps)). One
+   *   listener that does not advertise the meta therefore imposes a full frame
+   *   GPU to CPU download on every other consumer of the node, silently.
+   * - interpipesink is an appsink: it forwards buffers by reference and never
+   *   maps them, so it accepts the meta unconditionally.
+   *
+   * The consumer this can hurt is one that maps raw video by hand using the
+   * default GstVideoInfo strides instead of gst_video_frame_map. Anything built
+   * on GStreamer's video base classes reads the meta and is correct either way.
+   */
+  if (gst_inter_pipe_sink_query_is_raw_video (query)
+      && !gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE,
+          NULL)) {
+    GST_DEBUG_OBJECT (sink, "Offering %s on raw video caps",
+        g_type_name (GST_VIDEO_META_API_TYPE));
+    gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+  }
+
   g_mutex_unlock (&sink->listeners_mutex);
 
   return ret;
 }
 
 /* Appsink Callbacks */
+struct PushSampleCtx
+{
+  GstInterPipeSink *sink;
+  GstBuffer *buffer;
+  GstCaps *caps;
+  /* Read once per sample: it is the same for every listener in the fan-out and
+   * reading it takes the sink's object lock. */
+  guint64 basetime;
+};
+
 static void
 gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
     gpointer user_data)
@@ -868,13 +936,12 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
   GstInterPipeSink *sink;
   GstBuffer *buffer;
   GstCaps *caps;
-  guint64 basetime;
   gchar *listener_name;
-  gpointer *data_array = user_data;
+  struct PushSampleCtx *ctx = user_data;
 
-  sink = GST_INTER_PIPE_SINK (data_array[0]);
-  buffer = gst_buffer_ref (GST_BUFFER (data_array[1]));
-  caps = (GstCaps *) data_array[2];
+  sink = ctx->sink;
+  buffer = gst_buffer_ref (ctx->buffer);
+  caps = ctx->caps;
 
   listener = GST_INTER_PIPE_ILISTENER (data);
   listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
@@ -898,8 +965,7 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
 
   GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", buffer, listener_name);
 
-  basetime = gst_element_get_base_time (GST_ELEMENT (sink));
-  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, basetime))
+  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, ctx->basetime))
     GST_DEBUG_OBJECT (sink, "Listener %s did not accept the buffer",
         listener_name);
 }
@@ -909,7 +975,7 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
 {
   GHashTable *listeners;
   GstBuffer *buffer;
-  gpointer data[3];
+  struct PushSampleCtx ctx;
 
   g_mutex_lock (&sink->listeners_mutex);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
@@ -928,12 +994,13 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
   GST_LOG_OBJECT (sink, "Received new buffer %p on node %s", buffer,
       sink->node_name);
 
-  data[0] = sink;
-  data[1] = buffer;
+  ctx.sink = sink;
+  ctx.buffer = buffer;
   /* Sample carries the negotiated caps; push_to_listener uses them to set caps
    * on any listener that attached before this node had caps. */
-  data[2] = gst_sample_get_caps (sample);
-  g_hash_table_foreach (listeners, gst_inter_pipe_sink_push_to_listener, data);
+  ctx.caps = gst_sample_get_caps (sample);
+  ctx.basetime = gst_element_get_base_time (GST_ELEMENT (sink));
+  g_hash_table_foreach (listeners, gst_inter_pipe_sink_push_to_listener, &ctx);
   gst_sample_unref (sample);
 
   g_mutex_unlock (&sink->listeners_mutex);
@@ -1191,11 +1258,32 @@ gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
   GstInterPipeSink *self;
   GHashTable *listeners;
   GstPad *sinkpad;
+  const GstStructure *structure;
+  gboolean is_force_key_unit;
+  guint num_listeners;
 
   self = GST_INTER_PIPE_SINK (iface);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (self);
 
-  if (g_hash_table_size (listeners) != 1) {
+  /* A force-key-unit request is safe to forward even when several listeners
+   * share this node: the producer emits one extra keyframe, which every
+   * listener receives, for a small bitrate cost. Without this, a freshly
+   * attached consumer cannot ask for a keyframe and stays blank until the next
+   * periodic one. Every other upstream event stays confined to the
+   * single-listener case, so one consumer cannot disturb the others. */
+  structure = gst_event_get_structure (event);
+  is_force_key_unit = GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM
+      && structure != NULL
+      && gst_structure_has_name (structure, "GstForceKeyUnit");
+
+  /* add_listener and remove_listener mutate the table from other threads, so
+   * snapshot the count under the lock. The lock is released before pushing, so
+   * it is never held across gst_pad_push_event. */
+  g_mutex_lock (&self->listeners_mutex);
+  num_listeners = g_hash_table_size (listeners);
+  g_mutex_unlock (&self->listeners_mutex);
+
+  if (num_listeners != 1 && !is_force_key_unit) {
     gst_event_unref (event);
     goto multiple_listeners;
   }

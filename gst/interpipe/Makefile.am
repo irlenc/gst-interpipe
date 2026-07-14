@@ -11,9 +11,11 @@ libgstinterpipe_la_SOURCES = gstplugin.c gstinterpipe.c \
 libgstinterpipe_la_CFLAGS = $(GST_CFLAGS) \
 			$(GST_BASE_CFLAGS) \
 			$(GST_PLUGINS_BASE_CFLAGS) \
-			$(GST_APP_CFLAGS)
+			$(GST_APP_CFLAGS) \
+			$(GST_VIDEO_CFLAGS)
 libgstinterpipe_la_LIBADD = $(GST_PLUGINS_BASE_LIBS) \
-			$(GST_BASE_LIBS) $(GST_LIBS) $(GST_APP_LIBS)
+			$(GST_BASE_LIBS) $(GST_LIBS) $(GST_APP_LIBS) \
+			$(GST_VIDEO_LIBS)
 libgstinterpipe_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
 libgstinterpipe_la_LIBTOOLFLAGS = --tag=disable-static $(GST_PLUGIN_LIBTOOLFLAGS)
 

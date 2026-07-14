@@ -657,7 +657,7 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   g_mutex_lock (&src->serial_events_lock);
   if (!g_queue_is_empty (src->pending_serial_events)) {
     GstEvent *head = g_queue_peek_head (src->pending_serial_events);
-    guint curr_bytes;
+    guint64 curr_bytes;
 
     GST_DEBUG_OBJECT (src,
         "Got event with timestamp %" GST_TIME_FORMAT,
@@ -909,7 +909,18 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
         GST_TIME_ARGS (GST_BUFFER_PTS (buffer)));
   } else if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync) {
     if (GST_STATE (src) == GST_STATE_PLAYING) {
-      /* Remove the incoming timestamp to be generated according this basetime */
+      /* The node hands the same buffer to every listener and the appsink's
+       * sample still holds it, so it is shared: take a writable copy before
+       * touching its metadata. Writing the timestamps in place is an
+       * unsynchronized write to a mini-object other listeners may already have
+       * queued on their own streaming threads.
+       *
+       * The clear itself is load bearing: gst_base_src_set_do_timestamp is on
+       * for this mode and GstBaseSrc only stamps a buffer whose PTS/DTS are
+       * invalid, so the incoming timestamps have to go for this pipeline's base
+       * time to be applied. */
+      buffer = gst_buffer_make_writable (buffer);
+
       GST_BUFFER_PTS (buffer) = GST_CLOCK_TIME_NONE;
       GST_BUFFER_DTS (buffer) = GST_CLOCK_TIME_NONE;
     } else {

@@ -23,11 +23,11 @@ gst_interpipes_lib = library('gstinterpipe',
   include_directories : configinc,
   install : true,
   install_dir : plugin_install_dir,
-  dependencies : [gst_app_dep],
+  dependencies : [gst_app_dep, gst_video_dep],
 )
 
 interpipe_plugin_dir = meson.current_build_dir()
 
 # Define the library as an internal dependency to the current build
 interpipes_dep = declare_dependency(link_with: gst_interpipes_lib,
-  dependencies : [gst_app_dep])
+  dependencies : [gst_app_dep, gst_video_dep])

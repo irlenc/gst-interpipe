@@ -17,6 +17,8 @@ gst_interpipes_version_is_dev = gst_interpipes_version_minor % 2 == 1 and gst_in
 # Find external dependencies
 gst_app_dep = dependency('gstreamer-app-1.0', version : '>=1.0.5')
 gst_check_dep = dependency('gstreamer-check-1.0', version : '>=1.0.5')
+# For GST_VIDEO_META_API_TYPE in the allocation query aggregation.
+gst_video_dep = dependency('gstreamer-video-1.0', version : '>=1.0.5')
 
 # Define compiler args and include directories
 gst_c_args = ['-DHAVE_CONFIG_H']

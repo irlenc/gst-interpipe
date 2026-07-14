@@ -43,6 +43,9 @@ GST_DEBUG_CATEGORY (gst_inter_pipe_debug);
 typedef struct _GstInterPipeListenerPriv GstInterPipeListenerPriv;
 struct _GstInterPipeListenerPriv
 {
+  /* Strong reference. The table owns a ref on each registered listener so a
+   * listener finalized without leaving the table cannot be freed while an
+   * add_node/remove_node notification is dispatching to it. */
   GstInterPipeIListener *listener;
   /* Owned copy of the node name this listener is attached to. Duplicated on
    * store and freed on replace/remove so it never depends on the listener's
@@ -57,14 +60,23 @@ static GMutex nodes_mutex;
 
 static GHashTable *gst_inter_pipe_get_listeners ();
 static GHashTable *gst_inter_pipe_get_nodes ();
-static void gst_inter_pipe_notify_node_added (gpointer listener_name,
-    gpointer _listener, gpointer data);
-static void gst_inter_pipe_notify_node_removed (gpointer _listener_name,
+static void gst_inter_pipe_notify_node_added (gpointer _listener_key,
     gpointer _listener, gpointer data);
 static gboolean gst_inter_pipe_leave_listeners_table (GstInterPipeIListener *
     listener);
 static gboolean gst_inter_pipe_leave_node_priv (GstInterPipeIListener *
     listener);
+static void gst_inter_pipe_listener_priv_free (gpointer data);
+
+static void
+gst_inter_pipe_listener_priv_free (gpointer data)
+{
+  GstInterPipeListenerPriv *listener_priv = data;
+
+  gst_object_unref (listener_priv->listener);
+  g_free (listener_priv->listen_to);
+  g_free (listener_priv);
+}
 
 static GHashTable *
 gst_inter_pipe_get_listeners (void)
@@ -73,9 +85,26 @@ gst_inter_pipe_get_listeners (void)
   static GHashTable *gst_inter_pipe_listeners = NULL;
 
   if (!gst_inter_pipe_listeners) {
-    gst_inter_pipe_listeners = g_hash_table_new (g_str_hash, g_str_equal);
+    /* Key by the listener object: its pointer is stable for its lifetime and
+     * unique across pipelines, whereas its name is borrowed memory that a
+     * rename frees and that two listeners in different pipelines can share. The
+     * value owns a ref on the listener, so an entry can never outlive the
+     * object it points at. */
+    gst_inter_pipe_listeners =
+        g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
+        gst_inter_pipe_listener_priv_free);
   }
   return gst_inter_pipe_listeners;
+}
+
+/* Value destroy for the nodes table: clear and free the GWeakRef box. */
+static void
+gst_inter_pipe_node_weak_ref_free (gpointer data)
+{
+  GWeakRef *weak = (GWeakRef *) data;
+
+  g_weak_ref_clear (weak);
+  g_free (weak);
 }
 
 static GHashTable *
@@ -86,9 +115,12 @@ gst_inter_pipe_get_nodes (void)
 
   if (!gst_inter_pipe_nodes) {
     /* Own the key strings so the table never depends on the node's name
-     * outliving its entry. */
+     * outliving its entry. Values are GWeakRef boxes rather than borrowed
+     * strong pointers, so a lookup can never resurrect a finalizing node. See
+     * gst_inter_pipe_get_node. */
     gst_inter_pipe_nodes =
-        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
+        gst_inter_pipe_node_weak_ref_free);
   }
   return gst_inter_pipe_nodes;
 }
@@ -97,18 +129,22 @@ GstInterPipeINode *
 gst_inter_pipe_get_node (const gchar * node_name)
 {
   GHashTable *nodes;
-  GstInterPipeINode *value;
+  GWeakRef *weak;
+  GstInterPipeINode *value = NULL;
 
   g_return_val_if_fail (node_name != NULL, NULL);
 
   g_mutex_lock (&nodes_mutex);
   nodes = gst_inter_pipe_get_nodes ();
 
-  value = (GstInterPipeINode *) g_hash_table_lookup (nodes, node_name);
-  /* Return a strong reference taken under the lock so the node cannot be
-   * removed and finalized while a caller is still using it. */
-  if (value)
-    gst_object_ref (value);
+  /* g_weak_ref_get atomically returns a new strong reference, or NULL once the
+   * node has dropped to refcount 0 and is being finalized. Taking gst_object_ref
+   * on a borrowed pointer instead would resurrect a node that another thread is
+   * concurrently tearing down (refcount 0 -> 1 -> 0 = double finalize), leaving
+   * that thread's set_state and bin_remove operating on freed memory. */
+  weak = (GWeakRef *) g_hash_table_lookup (nodes, node_name);
+  if (weak)
+    value = (GstInterPipeINode *) g_weak_ref_get (weak);
   g_mutex_unlock (&nodes_mutex);
 
   return value;
@@ -133,11 +169,9 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   listener_name = gst_inter_pipe_ilistener_get_name (listener);
 
   GST_INFO ("listener %s listen to node %s", listener_name, node_name);
-  if (g_hash_table_contains (listeners, listener_name)) {
-    /*TODO: check if listener is the same listener from the list? */
-    listener_priv =
-        (GstInterPipeListenerPriv *) g_hash_table_lookup (listeners,
-        listener_name);
+  listener_priv =
+      (GstInterPipeListenerPriv *) g_hash_table_lookup (listeners, listener);
+  if (listener_priv) {
     if (!g_strcmp0 (listener_priv->listen_to, node_name))
       goto already_listen;
 
@@ -146,7 +180,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
 
   } else {
     listener_priv = g_malloc (sizeof (GstInterPipeListenerPriv));
-    listener_priv->listener = listener;
+    listener_priv->listener = gst_object_ref (listener);
     listener_priv->listen_to = NULL;
     priv_is_new = TRUE;
   }
@@ -169,8 +203,11 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
     gst_object_unref (node);
   }
 
-  g_hash_table_insert (listeners, (gchar *) listener_name,
-      (gpointer) listener_priv);
+  /* An existing priv is already in the table and was updated in place.
+   * Re-inserting it would destroy the value being inserted. */
+  if (priv_is_new)
+    g_hash_table_insert (listeners, (gpointer) listener,
+        (gpointer) listener_priv);
 
   g_rec_mutex_unlock (&listeners_mutex);
 
@@ -188,9 +225,10 @@ add_failed:
     /* We reach here only from the branch that holds a node reference. */
     gst_object_unref (node);
     /* A freshly allocated priv was never inserted into the table, so free it
-     * here. An existing priv is owned by the table and left in place. */
+     * here (dropping the ref it took). An existing priv is owned by the table
+     * and left in place. */
     if (priv_is_new)
-      g_free (listener_priv);
+      gst_inter_pipe_listener_priv_free (listener_priv);
     g_rec_mutex_unlock (&listeners_mutex);
     return FALSE;
   }
@@ -199,21 +237,13 @@ add_failed:
 static gboolean
 gst_inter_pipe_leave_listeners_table (GstInterPipeIListener * listener)
 {
-  GstInterPipeListenerPriv *listener_priv;
   GHashTable *listeners;
-  const gchar *listener_name;
 
   listeners = gst_inter_pipe_get_listeners ();
-  listener_name = gst_inter_pipe_ilistener_get_name (listener);
 
-  listener_priv = g_hash_table_lookup (listeners, listener_name);
-  if (!g_hash_table_remove (listeners, listener_name))
-    return FALSE;
-
-  g_free (listener_priv->listen_to);
-  g_free (listener_priv);
-
-  return TRUE;
+  /* Removing the entry runs the value destroy notify, which frees the priv and
+   * drops the table's ref on the listener. */
+  return g_hash_table_remove (listeners, listener);
 }
 
 static gboolean
@@ -230,8 +260,7 @@ gst_inter_pipe_leave_node_priv (GstInterPipeIListener * listener)
   listener_name = gst_inter_pipe_ilistener_get_name (listener);
 
   listener_priv =
-      (GstInterPipeListenerPriv *) g_hash_table_lookup (listeners,
-      listener_name);
+      (GstInterPipeListenerPriv *) g_hash_table_lookup (listeners, listener);
   if (!listener_priv)
     goto no_listener;
 
@@ -304,7 +333,7 @@ list_error:
 }
 
 static void
-gst_inter_pipe_notify_node_added (gpointer listener_name, gpointer _listener,
+gst_inter_pipe_notify_node_added (gpointer _listener_key, gpointer _listener,
     gpointer data)
 {
   GstInterPipeListenerPriv *listener_priv = _listener;
@@ -333,8 +362,18 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
 
   GST_INFO ("Adding node %s", node_name);
 
-  if (!g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) node))
-    goto add_error;
+  {
+    /* The table stores a GWeakRef box, so it still does not keep the node
+     * alive, but a concurrent gst_inter_pipe_get_node can no longer resurrect
+     * it mid-finalize. The g_hash_table_contains check above runs under this
+     * same lock and guarantees the key is unique, so the insert always adds a
+     * fresh entry and the table takes ownership of the box through its
+     * value-destroy func. */
+    GWeakRef *weak = g_new0 (GWeakRef, 1);
+
+    g_weak_ref_init (weak, node);
+    g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) weak);
+  }
 
   g_mutex_unlock (&nodes_mutex);
 
@@ -352,25 +391,6 @@ no_unique:
     g_mutex_unlock (&nodes_mutex);
     return FALSE;
   }
-add_error:
-  {
-    GST_INFO ("Could not add node %s", node_name);
-    g_mutex_unlock (&nodes_mutex);
-    return FALSE;
-  }
-}
-
-static void
-gst_inter_pipe_notify_node_removed (gpointer _listener_name, gpointer _listener,
-    gpointer data)
-{
-  gchar *node_name = data;
-  GstInterPipeListenerPriv *listener_priv = _listener;
-  GstInterPipeIListener *listener = listener_priv->listener;
-
-  GST_INFO ("Notifying node removed: %s", node_name);
-
-  gst_inter_pipe_ilistener_node_removed (listener, node_name);
 }
 
 gboolean
@@ -378,6 +398,8 @@ gst_inter_pipe_remove_node (GstInterPipeINode * node, const gchar * node_name)
 {
   GHashTable *nodes;
   GHashTable *listeners;
+  GList *listener_list;
+  GList *l;
 
   g_return_val_if_fail (node != NULL, FALSE);
   g_return_val_if_fail (node_name != NULL, FALSE);
@@ -395,8 +417,25 @@ gst_inter_pipe_remove_node (GstInterPipeINode * node, const gchar * node_name)
 
   g_rec_mutex_lock (&listeners_mutex);
   listeners = gst_inter_pipe_get_listeners ();
-  g_hash_table_foreach (listeners, gst_inter_pipe_notify_node_removed,
-      (gpointer) node_name);
+
+  /* Snapshot the listeners, holding a ref on each: a listener that is attached
+   * to this node leaves it from its node_removed handler, which removes its
+   * entry from this very table, and g_hash_table_foreach may not run over a
+   * table that the callback modifies. The ref keeps the listener alive across
+   * the notification even though leaving drops the table's own ref. */
+  listener_list = g_hash_table_get_values (listeners);
+  for (l = listener_list; l != NULL; l = l->next) {
+    GstInterPipeListenerPriv *listener_priv = l->data;
+
+    l->data = gst_object_ref (listener_priv->listener);
+  }
+
+  for (l = listener_list; l != NULL; l = l->next) {
+    GST_INFO ("Notifying node removed: %s", node_name);
+    gst_inter_pipe_ilistener_node_removed (l->data, node_name);
+  }
+
+  g_list_free_full (listener_list, gst_object_unref);
   g_rec_mutex_unlock (&listeners_mutex);
 
   return TRUE;
