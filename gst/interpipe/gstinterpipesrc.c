@@ -806,8 +806,26 @@ gst_inter_pipe_src_set_caps (GstInterPipeIListener * iface,
   appsrc = GST_APP_SRC (src);
 
   appcaps = gst_app_src_get_caps (appsrc);
-  if (appcaps && !src->allow_renegotiation)
+  if (appcaps && !src->allow_renegotiation) {
+    /* Re-setting the caps already in force is not a renegotiation, so accept
+     * it and mark the attachment primed.
+     *
+     * Without this a listener with renegotiation disabled logs an error for
+     * every buffer it ever receives. listen_node clears caps_primed on each
+     * (re)attach but leaves the previous caps on the appsrc, so the sink's
+     * per-buffer priming (which is gated on is_negotiated) calls this again for
+     * every buffer; the refusal below returns without setting caps_primed, so
+     * the flag never recovers and the next buffer repeats it. On a 60fps scene
+     * with a video and an audio leg that is around ten thousand error lines a
+     * minute, all of them describing a no-op, and they bury the logs that
+     * matter. A genuine caps change is still refused. */
+    if (gst_caps_is_equal (appcaps, caps)) {
+      gst_caps_unref (appcaps);
+      src->caps_primed = TRUE;
+      return TRUE;
+    }
     goto allow_renegotiation_disabled;
+  }
 
   GST_INFO_OBJECT (src, "Setting listener caps %" GST_PTR_FORMAT
       " (previous: %" GST_PTR_FORMAT ")", caps, appcaps);
