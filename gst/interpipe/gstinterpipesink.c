@@ -69,6 +69,8 @@ static void gst_inter_pipe_sink_set_property (GObject * object, guint prop_id,
 static void gst_inter_pipe_sink_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 static void gst_inter_pipe_sink_finalize (GObject * object);
+static GstStateChangeReturn gst_inter_pipe_sink_change_state (GstElement *
+    element, GstStateChange transition);
 static GstFlowReturn gst_inter_pipe_sink_new_buffer (GstAppSink * sink,
     gpointer data);
 static GstFlowReturn gst_inter_pipe_sink_new_preroll (GstAppSink * asink,
@@ -110,6 +112,16 @@ struct _GstInterPipeSink
 
   /** Node name */
   gchar *node_name;
+
+  /** Whether node_name is currently published in the node registry.
+   *
+   * Registration is a claim on a process-global name that can fail (another
+   * sink already holds it), and a sink that failed to claim it publishes
+   * nothing: every listener waits forever on a node that will never appear.
+   * Tracking the claim lets the state change refuse to go up instead, and lets
+   * the registry entry be retired on the way down rather than whenever the
+   * object happens to be finalized. */
+  gboolean node_registered;
 
   /** The list of listeners */
   GHashTable *listeners;
@@ -180,6 +192,9 @@ gst_inter_pipe_sink_class_init (GstInterPipeSinkClass * klass)
           "Number of interpipe sources listening to this specific sink",
           0, G_MAXUINT, 0, G_PARAM_READABLE));
 
+  element_class->change_state =
+      GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_change_state);
+
   basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_get_caps);
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_set_caps);
   basesink_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_event);
@@ -196,12 +211,20 @@ gst_inter_pipe_sink_update_node_name (GstInterPipeSink * sink,
   node = GST_INTER_PIPE_INODE (sink);
 
   if (sink->node_name) {
-    gst_inter_pipe_remove_node (node, sink->node_name);
+    if (sink->node_registered)
+      gst_inter_pipe_remove_node (node, sink->node_name);
     g_free (sink->node_name);
   }
 
   sink->node_name = gst_object_get_name (GST_OBJECT (sink));
-  gst_inter_pipe_add_node (node, sink->node_name);
+  sink->node_registered = gst_inter_pipe_add_node (node, sink->node_name);
+  /* A warning rather than an element error: this runs from a "notify::name"
+   * callback, including the one during init, where the element has no bus to
+   * post to yet. gst_inter_pipe_sink_change_state turns a still-unclaimed name
+   * into a real error on the way to READY. */
+  if (!sink->node_registered)
+    GST_WARNING_OBJECT (sink, "Node name \"%s\" is already taken; this sink "
+        "publishes nothing until it is renamed", sink->node_name);
 }
 
 static void
@@ -300,6 +323,62 @@ gst_inter_pipe_sink_get_property (GObject * object, guint prop_id,
   }
 }
 
+/* Claims the node name on the way up and retires it on the way down.
+ *
+ * Registration used to happen only when the name was set and deregistration
+ * only at finalize, so the registry's idea of what is published was tied to
+ * GObject refcounts: a failed claim was a silent no-op that left every listener
+ * waiting on a node that never appears, and a sink kept alive by a stray
+ * reference kept publishing a name nothing serves.
+ *
+ * The claim is released at READY_TO_NULL rather than PAUSED_TO_READY: a
+ * listener notified of a removed node leaves the registry's listener table
+ * entirely and is never notified when the node comes back, so retiring the node
+ * at READY would permanently detach every listener from a producer that was
+ * merely paused (a stopped playlist, for one). Making that transition safe
+ * needs the pending-listener state that belongs with the interpipe control
+ * plane work, not here. */
+static GstStateChangeReturn
+gst_inter_pipe_sink_change_state (GstElement * element,
+    GstStateChange transition)
+{
+  GstInterPipeSink *sink;
+  GstStateChangeReturn ret;
+
+  sink = GST_INTER_PIPE_SINK (element);
+
+  if (transition == GST_STATE_CHANGE_NULL_TO_READY) {
+    /* Retry the claim: the name may have been taken when it was set and freed
+     * since (a previous instance of this element torn down, for instance). */
+    if (!sink->node_registered && sink->node_name)
+      sink->node_registered =
+          gst_inter_pipe_add_node (GST_INTER_PIPE_INODE (sink),
+          sink->node_name);
+
+    if (!sink->node_registered) {
+      GST_ELEMENT_ERROR (sink, RESOURCE, BUSY,
+          ("Another interpipesink already publishes the node name \"%s\"",
+              GST_STR_NULL (sink->node_name)),
+          ("Interpipe node names are process global and must be unique"));
+      return GST_STATE_CHANGE_FAILURE;
+    }
+  }
+
+  ret =
+      GST_ELEMENT_CLASS (gst_inter_pipe_sink_parent_class)->change_state
+      (element, transition);
+  if (ret == GST_STATE_CHANGE_FAILURE)
+    return ret;
+
+  if (transition == GST_STATE_CHANGE_READY_TO_NULL && sink->node_registered) {
+    GST_DEBUG_OBJECT (sink, "Retiring node %s", sink->node_name);
+    gst_inter_pipe_remove_node (GST_INTER_PIPE_INODE (sink), sink->node_name);
+    sink->node_registered = FALSE;
+  }
+
+  return ret;
+}
+
 static void
 gst_inter_pipe_sink_finalize (GObject * object)
 {
@@ -310,9 +389,13 @@ gst_inter_pipe_sink_finalize (GObject * object)
   node = GST_INTER_PIPE_INODE (sink);
 
   if (sink->node_name != NULL) {
-    GST_DEBUG_OBJECT (sink, "Removing node %s and associated listeners",
-        sink->node_name);
-    gst_inter_pipe_remove_node (node, sink->node_name);
+    /* Normally already retired by the READY_TO_NULL transition; this covers a
+     * sink that was disposed without ever reaching READY. */
+    if (sink->node_registered) {
+      GST_DEBUG_OBJECT (sink, "Removing node %s and associated listeners",
+          sink->node_name);
+      gst_inter_pipe_remove_node (node, sink->node_name);
+    }
     g_free (sink->node_name);
   }
 
@@ -435,6 +518,7 @@ gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
   GstInterPipeSink *sink;
   GHashTable *listeners;
   GstCaps *intercept_caps = NULL;
+  GstCaps *failed_caps = NULL;
   GList *listeners_list;
   GList *l;
 
@@ -493,16 +577,32 @@ gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
   /* No usable intersection: detach every listener and reset the negotiated
    * caps. Snapshot the listeners holding a ref each, drop the lock, then call
    * leave_node, which re-enters this element through remove_listener and would
-   * deadlock if called under the lock. */
+   * deadlock if called under the lock.
+   *
+   * This is terminal, not transient. A detached listener leaves the registry's
+   * listener table, so it is never notified when this node republishes: every
+   * consumer of this node is disconnected for good, and the only signal used to
+   * be a GST_ERROR line in the log. Post it on the bus so a supervisor sees the
+   * producer fail and rebuilds it, rather than watching every consumer of a
+   * live-looking pipeline quietly freeze. The post happens after the unlock,
+   * like the leave_node calls and for the same reason. */
   listeners_list = g_hash_table_get_values (listeners);
   for (l = listeners_list; l != NULL; l = l->next)
     gst_object_ref (l->data);
 
   if (sink->caps_negotiated) {
-    gst_caps_unref (sink->caps_negotiated);
+    failed_caps = sink->caps_negotiated;
     sink->caps_negotiated = NULL;
   }
   g_mutex_unlock (&sink->listeners_mutex);
+
+  GST_ELEMENT_ERROR (sink, STREAM, FORMAT,
+      ("No caps intersection between this node and its listeners; every "
+          "listener has been detached"),
+      ("negotiated %" GST_PTR_FORMAT ", filter %" GST_PTR_FORMAT, failed_caps,
+          filter));
+  if (failed_caps)
+    gst_caps_unref (failed_caps);
 
   for (l = listeners_list; l != NULL; l = l->next) {
     GstInterPipeIListener *listener = l->data;
