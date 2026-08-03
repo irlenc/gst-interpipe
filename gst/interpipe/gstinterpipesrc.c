@@ -168,6 +168,16 @@ struct _GstInterPipeSrc
    * buffer. Backs gst_inter_pipe_src_is_negotiated. */
   gboolean caps_primed;
 
+  /* Set on every (re)attach, cleared once the flag has been stamped on a
+   * buffer. What a listener sees across an attach is discontinuous by
+   * construction: a different producer, a different running time, and a gap of
+   * unknown length. Without the flag downstream reads the first buffer of the
+   * new node as the next buffer of the old one, and elements that close gaps
+   * (parsers, synchronizers, muxers) try to close one that is not a gap.
+   * Atomic: written by whichever thread flips listen-to, read on the producer's
+   * streaming thread. */
+  gint needs_discont;
+
   /* Allow caps renegotiation */
   gboolean allow_renegotiation;
 
@@ -270,6 +280,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->allow_renegotiation = TRUE;
   src->first_switch = TRUE;
   src->caps_primed = FALSE;
+  src->needs_discont = FALSE;
   src->stream_sync = GST_INTER_PIPE_SRC_PASSTHROUGH_TIMESTAMP;
   src->accept_events = TRUE;
   src->accept_eos_event = TRUE;
@@ -952,6 +963,17 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
     }
   }
 
+  /* First buffer after an attach: mark the discontinuity it is. The node hands
+   * the same buffer to every listener, so take a writable copy (a shallow one,
+   * the memory stays refcounted) rather than flagging a mini-object the other
+   * listeners already hold. Compare-and-exchange because two producer threads
+   * can race here across a switch, and exactly one buffer should carry it. */
+  if (g_atomic_int_compare_and_exchange (&src->needs_discont, TRUE, FALSE)) {
+    buffer = gst_buffer_make_writable (buffer);
+    GST_BUFFER_FLAG_SET (buffer, GST_BUFFER_FLAG_DISCONT);
+    GST_DEBUG_OBJECT (src, "Marked the first buffer after attach discontinuous");
+  }
+
   ret = gst_app_src_push_buffer (appsrc, buffer);
   if (ret != GST_FLOW_OK)
     return FALSE;
@@ -1090,8 +1112,10 @@ gst_inter_pipe_src_listen_node (GstInterPipeSrc * src, const gchar * node_name)
     src->first_switch = FALSE;
 
   /* New attachment: force caps to be re-primed from the new node's first
-   * buffer (the node may publish different caps than the previous one). */
+   * buffer (the node may publish different caps than the previous one), and
+   * mark the first buffer that arrives from it discontinuous. */
   src->caps_primed = FALSE;
+  g_atomic_int_set (&src->needs_discont, TRUE);
 
   if (!gst_inter_pipe_listen_node (listener, node_name)) {
     gchar *current;
