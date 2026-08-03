@@ -27,8 +27,15 @@
 #include <gst/app/gstappsink.h>
 
 /*
- * Given one interpipesrc and one interpipesink, when there's not
- * caps intersection, the caps must not be set.
+ * Given one interpipesrc and one interpipesink with no caps intersection, the
+ * caps must not be set, and the sink must say so on its bus.
+ *
+ * The no-intersection path detaches every listener, and a detached listener
+ * leaves the registry's listener table, so it is never notified when the node
+ * republishes: the disconnection is permanent. This used to be reported only as
+ * a GST_ERROR log line while the sink stayed happily in PLAYING, which is a
+ * producer that looks alive and serves nobody, forever. The sink now posts an
+ * element error, so a supervising application finds out.
  */
 
 GST_START_TEST (invalid_caps)
@@ -39,6 +46,8 @@ GST_START_TEST (invalid_caps)
   GstElement *intersrc;
   GstCaps *caps1;
   GstCaps *caps2;
+  GstMessage *msg;
+  GstBus *bus;
   GError *error = NULL;
 
   /* Create two sink pipelines */
@@ -69,17 +78,30 @@ GST_START_TEST (invalid_caps)
           NULL, NULL, GST_CLOCK_TIME_NONE));
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_set_state (GST_ELEMENT (sink), GST_STATE_PLAYING));
-  fail_if (GST_STATE_CHANGE_FAILURE ==
-      gst_element_get_state (GST_ELEMENT (sink), NULL, NULL,
-          GST_CLOCK_TIME_NONE));
+  /* No get_state on the sink here: it is expected to fail its state change now
+   * that the empty intersection is an error, and that is what the bus check
+   * below asserts. */
 
-  /* Verifies if interpipesink and interpipesrc have caps set
-   */
+  /* The sink reports the failed negotiation on its bus rather than detaching
+   * every listener quietly. */
+  bus = gst_pipeline_get_bus (sink);
+  msg = gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND, GST_MESSAGE_ERROR);
+  fail_if (!msg, "the sink must post an error when no listener caps intersect");
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+
+  /* The listener never gets caps: that is the no-intersection case itself.
+   *
+   * Whether the sink has caps by now is deliberately not asserted. It races its
+   * own error: the upstream caps may or may not have been set on the appsink
+   * before the failed intersection stopped the state change, and both outcomes
+   * are correct. The error above is the contract; this is timing. */
   caps1 = gst_app_src_get_caps (GST_APP_SRC (intersrc));
   fail_if (caps1);
 
   caps2 = gst_app_sink_get_caps (GST_APP_SINK (intersink));
-  fail_if (!caps2);
+  if (caps2)
+    gst_caps_unref (caps2);
 
   /* Stop pipelines */
   fail_if (GST_STATE_CHANGE_FAILURE ==
