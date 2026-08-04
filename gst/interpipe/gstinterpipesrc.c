@@ -1009,6 +1009,29 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
   if (!src->accept_events)
     goto no_events;
 
+  if (GST_EVENT_TYPE (event) == GST_EVENT_SEGMENT) {
+    /* The publisher's segment describes the publisher's timeline, and this
+     * element is on a different one. Forwarding it puts a second segment
+     * downstream, after the correct one appsrc already pushed, and downstream
+     * keeps the last: every buffer this element then produces is outside it and
+     * the next sink clips the whole stream away without a word.
+     *
+     * Measured on a VA decoder feeding a hop: 602 buffers published, 602
+     * dequeued here, 601 dropped by the consumer's sink as "out of clipping
+     * segment", nothing logged by either element. It stayed hidden because a
+     * publisher whose segment starts at zero (videotestsrc, and every test that
+     * used one) produces a forwarded segment that happens to agree.
+     *
+     * Neither stream-sync mode wants it. restart-ts rebases buffers onto this
+     * element's running time by definition, and compensate-ts shifts them onto
+     * it by the base-time difference; in both cases appsrc's own TIME segment is
+     * the one that describes what leaves this pad. */
+    GST_DEBUG_OBJECT (src, "Dropping the publisher's segment event; this "
+        "element's own segment describes its output");
+    gst_event_unref (event);
+    return TRUE;
+  }
+
   if (!GST_EVENT_IS_SERIALIZED (event)) {
 
     GST_INFO_OBJECT (src, "Incoming non-serialized event %s",
