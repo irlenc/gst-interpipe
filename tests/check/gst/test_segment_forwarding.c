@@ -171,17 +171,10 @@ flush_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 /*
  * A flushing seek on the producer is forwarded through the node, and the
  * FLUSH_STOP that reaches this element's downstream clears the segment in
- * force there. appsrc does not send another for a flush it never saw, so a
- * restart-ts consumer has to restore one itself, from its own timeline, when
- * the producer's segment follows the flush. Without it every buffer after the
- * seek flows with no segment at all.
- *
- * The seek is made with the producer paused and the consumer idle, so that no
- * buffer is in flight on the consumer when the forwarded FLUSH_START reaches
- * it. interpipesrc pushes that FLUSH_START straight onto its own source pad,
- * and one that lands while the base class loop is pushing a buffer pauses the
- * consumer's streaming task with nothing to restart it: a separate defect this
- * test is not about.
+ * force there. A restart-ts consumer drops the producer's segment that
+ * follows, so a segment of its own timeline has to be restored before the
+ * next buffer. Without it every buffer after the seek flows with no segment
+ * at all. test_flush_forwarding covers a flush landing mid-push.
  */
 GST_START_TEST (test_segment_restored_after_producer_flush)
 {
@@ -220,13 +213,7 @@ GST_START_TEST (test_segment_restored_after_producer_flush)
   fail_if (gst_element_get_state (producer, NULL, NULL,
           GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
 
-  /* Let the stream settle, then pause the producer and give the consumer time
-   * to drain what it already has. */
-  g_usleep (300 * G_TIME_SPAN_MILLISECOND);
-  fail_if (gst_element_set_state (producer, GST_STATE_PAUSED) ==
-      GST_STATE_CHANGE_FAILURE);
-  fail_if (gst_element_get_state (producer, NULL, NULL,
-          GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
+  /* Let the stream settle before the seek. */
   g_usleep (300 * G_TIME_SPAN_MILLISECOND);
 
   g_mutex_lock (&counts.lock);
@@ -234,10 +221,6 @@ GST_START_TEST (test_segment_restored_after_producer_flush)
   g_mutex_unlock (&counts.lock);
   fail_unless (gst_element_seek_simple (producer, GST_FORMAT_TIME,
           GST_SEEK_FLAG_FLUSH, 10 * GST_SECOND));
-  fail_if (gst_element_get_state (producer, NULL, NULL,
-          GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
-  fail_if (gst_element_set_state (producer, GST_STATE_PLAYING) ==
-      GST_STATE_CHANGE_FAILURE);
 
   for (waited = 0; waited < 100; waited++) {
     g_mutex_lock (&counts.lock);
