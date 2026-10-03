@@ -55,6 +55,19 @@ typedef struct
   guint buffers;
 } Counts;
 
+/* What reached the consumer's downstream after the producer's flushing seek:
+ * segments, their starts, and buffers pushed while no segment was in force on
+ * the pad. */
+typedef struct
+{
+  GMutex lock;
+  gboolean seeked;
+  guint segments;
+  guint nonzero_starts;
+  guint buffers;
+  guint unsegmented;
+} FlushCounts;
+
 static GstPadProbeReturn
 count_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
@@ -122,6 +135,137 @@ GST_START_TEST (test_one_segment_downstream)
 
 GST_END_TEST;
 
+static GstPadProbeReturn
+flush_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  FlushCounts *counts = user_data;
+  GstEvent *sticky;
+
+  g_mutex_lock (&counts->lock);
+  if (!counts->seeked) {
+    g_mutex_unlock (&counts->lock);
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    counts->buffers++;
+    sticky = gst_pad_get_sticky_event (pad, GST_EVENT_SEGMENT, 0);
+    if (sticky)
+      gst_event_unref (sticky);
+    else
+      counts->unsegmented++;
+  } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) ==
+      GST_EVENT_SEGMENT) {
+    const GstSegment *segment;
+
+    gst_event_parse_segment (GST_PAD_PROBE_INFO_EVENT (info), &segment);
+    counts->segments++;
+    if (segment->start != 0)
+      counts->nonzero_starts++;
+  }
+  g_mutex_unlock (&counts->lock);
+
+  return GST_PAD_PROBE_OK;
+}
+
+/*
+ * A flushing seek on the producer is forwarded through the node, and the
+ * FLUSH_STOP that reaches this element's downstream clears the segment in
+ * force there. appsrc does not send another for a flush it never saw, so a
+ * restart-ts consumer has to restore one itself, from its own timeline, when
+ * the producer's segment follows the flush. Without it every buffer after the
+ * seek flows with no segment at all.
+ *
+ * The seek is made with the producer paused and the consumer idle, so that no
+ * buffer is in flight on the consumer when the forwarded FLUSH_START reaches
+ * it. interpipesrc pushes that FLUSH_START straight onto its own source pad,
+ * and one that lands while the base class loop is pushing a buffer pauses the
+ * consumer's streaming task with nothing to restart it: a separate defect this
+ * test is not about.
+ */
+GST_START_TEST (test_segment_restored_after_producer_flush)
+{
+  GstElement *producer, *consumer;
+  GstElement *interpipesrc;
+  GstPad *srcpad;
+  FlushCounts counts = { {0}, FALSE, 0, 0, 0, 0 };
+  guint waited, buffers;
+
+  g_mutex_init (&counts.lock);
+
+  producer =
+      gst_parse_launch
+      ("videotestsrc ! video/x-raw,width=64,height=48,framerate=30/1 "
+      "! interpipesink name=flushnode sync=true", NULL);
+  fail_if (producer == NULL);
+
+  consumer =
+      gst_parse_launch
+      ("interpipesrc name=src listen-to=flushnode is-live=true format=time "
+      "stream-sync=restart-ts ! fakesink sync=false async=false", NULL);
+  fail_if (consumer == NULL);
+
+  interpipesrc = gst_bin_get_by_name (GST_BIN (consumer), "src");
+  fail_if (interpipesrc == NULL);
+  srcpad = gst_element_get_static_pad (interpipesrc, "src");
+  fail_if (srcpad == NULL);
+  gst_pad_add_probe (srcpad,
+      GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      flush_probe, &counts, NULL);
+
+  fail_if (gst_element_set_state (consumer, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+  fail_if (gst_element_set_state (producer, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+  fail_if (gst_element_get_state (producer, NULL, NULL,
+          GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
+
+  /* Let the stream settle, then pause the producer and give the consumer time
+   * to drain what it already has. */
+  g_usleep (300 * G_TIME_SPAN_MILLISECOND);
+  fail_if (gst_element_set_state (producer, GST_STATE_PAUSED) ==
+      GST_STATE_CHANGE_FAILURE);
+  fail_if (gst_element_get_state (producer, NULL, NULL,
+          GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
+  g_usleep (300 * G_TIME_SPAN_MILLISECOND);
+
+  g_mutex_lock (&counts.lock);
+  counts.seeked = TRUE;
+  g_mutex_unlock (&counts.lock);
+  fail_unless (gst_element_seek_simple (producer, GST_FORMAT_TIME,
+          GST_SEEK_FLAG_FLUSH, 10 * GST_SECOND));
+  fail_if (gst_element_get_state (producer, NULL, NULL,
+          GST_CLOCK_TIME_NONE) == GST_STATE_CHANGE_FAILURE);
+  fail_if (gst_element_set_state (producer, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  for (waited = 0; waited < 100; waited++) {
+    g_mutex_lock (&counts.lock);
+    buffers = counts.buffers;
+    g_mutex_unlock (&counts.lock);
+    if (buffers >= 10)
+      break;
+    g_usleep (50 * G_TIME_SPAN_MILLISECOND);
+  }
+
+  gst_element_set_state (consumer, GST_STATE_NULL);
+  gst_element_set_state (producer, GST_STATE_NULL);
+
+  fail_unless (counts.buffers >= 10,
+      "only %u buffers left interpipesrc after the seek", counts.buffers);
+  fail_unless (counts.segments >= 1, "no segment restored after the flush");
+  fail_unless_equals_int (counts.nonzero_starts, 0);
+  fail_unless_equals_int (counts.unsegmented, 0);
+
+  g_mutex_clear (&counts.lock);
+  gst_object_unref (srcpad);
+  gst_object_unref (interpipesrc);
+  gst_object_unref (consumer);
+  gst_object_unref (producer);
+}
+
+GST_END_TEST;
+
 static Suite *
 gst_interpipe_suite (void)
 {
@@ -130,6 +274,7 @@ gst_interpipe_suite (void)
 
   suite_add_tcase (suite, tc);
   tcase_add_test (tc, test_one_segment_downstream);
+  tcase_add_test (tc, test_segment_restored_after_producer_flush);
 
   return suite;
 }

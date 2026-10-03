@@ -8,6 +8,7 @@ core_tests = [
   [ 'gst/test_cold_attach.c' ],
   [ 'gst/test_force_key_unit_event.c' ],
   [ 'gst/test_stream_sync.c' ],
+  [ 'gst/test_stream_sync_retiming.c' ],
   [ 'gst/test_get_caps.c' ],
   [ 'gst/test_hot_plug.c' ],
   [ 'gst/test_in_bounds_events.c' ],
@@ -18,6 +19,7 @@ core_tests = [
   [ 'gst/test_producer_latency.c' ],
   [ 'gst/test_reconfigure_event.c' ],
   [ 'gst/test_segment_forwarding.c' ],
+  [ 'gst/test_serial_event_order.c' ],
   [ 'gst/test_set_caps.c' ],
   [ 'gst/test_videocrop_format.c' ],
 ]
