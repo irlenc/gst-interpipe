@@ -90,6 +90,7 @@ static gboolean gst_inter_pipe_sink_set_caps (GstBaseSink * base,
     GstCaps * filter);
 static gboolean gst_inter_pipe_sink_event (GstBaseSink * base,
     GstEvent * event);
+static gboolean gst_inter_pipe_sink_stop (GstBaseSink * base);
 static gboolean gst_inter_pipe_sink_send_event (GstElement * element,
     GstEvent * event);
 static void gst_inter_pipe_sink_delay_changed (GObject * object,
@@ -144,6 +145,16 @@ struct _GstInterPipeSink
 
   /** Last buffer timestamp */
   guint64 last_buffer_timestamp;
+
+  /* The buffer forwarded from preroll because the pipeline was staying
+   * paused, and the listeners that took it, kept until the base sink renders
+   * it so that render forwards it only to listeners that do not have it yet
+   * (one attached while paused, or one that refused it). Holding the ref keeps
+   * the pointer from being reused for another buffer in the meantime. The set
+   * holds borrowed pointers, removed in remove_listener. Guarded by the object
+   * lock. */
+  GstBuffer *preroll_buffer;
+  GHashTable *preroll_listeners;
 
   GMutex listeners_mutex;
 };
@@ -202,6 +213,7 @@ gst_inter_pipe_sink_class_init (GstInterPipeSinkClass * klass)
   basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_get_caps);
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_set_caps);
   basesink_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_event);
+  basesink_class->stop = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_stop);
   element_class->send_event =
       GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_send_event);
   basesink_class->propose_allocation =
@@ -250,6 +262,8 @@ gst_inter_pipe_sink_init (GstInterPipeSink * sink)
   sink->forward_eos = FALSE;
   sink->forward_events = TRUE;
   sink->last_buffer_timestamp = 0;
+  sink->preroll_buffer = NULL;
+  sink->preroll_listeners = NULL;
 
   /* These change how long after its running time this sink hands a buffer
    * over, which listeners report as latency. */
@@ -394,6 +408,17 @@ gst_inter_pipe_sink_change_state (GstElement * element,
   return ret;
 }
 
+/* Forget the buffer forwarded at preroll. Call with the object lock held. */
+static void
+gst_inter_pipe_sink_clear_preroll (GstInterPipeSink * sink)
+{
+  gst_buffer_replace (&sink->preroll_buffer, NULL);
+  if (sink->preroll_listeners) {
+    g_hash_table_destroy (sink->preroll_listeners);
+    sink->preroll_listeners = NULL;
+  }
+}
+
 static void
 gst_inter_pipe_sink_finalize (GObject * object)
 {
@@ -421,6 +446,8 @@ gst_inter_pipe_sink_finalize (GObject * object)
   if (sink->caps_negotiated) {
     gst_caps_unref (sink->caps_negotiated);
   }
+
+  gst_inter_pipe_sink_clear_preroll (sink);
 
   g_hash_table_destroy (sink->listeners);
 
@@ -736,6 +763,14 @@ gst_inter_pipe_sink_event (GstBaseSink * base, GstEvent * event)
 
   sink = GST_INTER_PIPE_SINK (base);
 
+  /* A flush discards the prerolled buffer without rendering it; the next one
+   * prerolled must not be compared against it. */
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+    GST_OBJECT_LOCK (sink);
+    gst_inter_pipe_sink_clear_preroll (sink);
+    GST_OBJECT_UNLOCK (sink);
+  }
+
   g_mutex_lock (&sink->listeners_mutex);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
 
@@ -917,6 +952,20 @@ gst_inter_pipe_sink_query_is_raw_video (GstQuery * query)
   return FALSE;
 }
 
+static gboolean
+gst_inter_pipe_sink_stop (GstBaseSink * base)
+{
+  GstInterPipeSink *sink = GST_INTER_PIPE_SINK (base);
+
+  /* A buffer prerolled but never rendered (flushed, or the pipeline stopped
+   * in PAUSED) must not be matched against the next run's buffers. */
+  GST_OBJECT_LOCK (sink);
+  gst_inter_pipe_sink_clear_preroll (sink);
+  GST_OBJECT_UNLOCK (sink);
+
+  return GST_BASE_SINK_CLASS (gst_inter_pipe_sink_parent_class)->stop (base);
+}
+
 static void
 gst_inter_pipe_sink_notify_latency_changed (gpointer key, gpointer value,
     gpointer user_data)
@@ -1074,7 +1123,7 @@ gst_inter_pipe_sink_propose_allocation (GstBaseSink * base, GstQuery * query)
 }
 
 /* Appsink Callbacks */
-struct PushSampleCtx
+typedef struct
 {
   GstInterPipeSink *sink;
   GstBuffer *buffer;
@@ -1082,25 +1131,26 @@ struct PushSampleCtx
   /* Read once per sample: it is the same for every listener in the fan-out and
    * reading it takes the sink's object lock. */
   guint64 basetime;
-};
+  /* Listeners to leave out (they already have this buffer), or NULL. */
+  GHashTable *skip;
+  /* Where to record the listeners that took the buffer, or NULL. */
+  GHashTable *accepted;
+} GstInterPipeSinkFanOut;
 
 static void
 gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
     gpointer user_data)
 {
+  GstInterPipeSinkFanOut *fan_out = user_data;
+  GstInterPipeSink *sink = fan_out->sink;
   GstInterPipeIListener *listener;
-  GstInterPipeSink *sink;
-  GstBuffer *buffer;
-  GstCaps *caps;
-  gchar *listener_name;
-  struct PushSampleCtx *ctx = user_data;
-
-  sink = ctx->sink;
-  buffer = gst_buffer_ref (ctx->buffer);
-  caps = ctx->caps;
+  const gchar *listener_name;
 
   listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
+  listener_name = gst_inter_pipe_ilistener_get_name (listener);
+
+  if (fan_out->skip && g_hash_table_contains (fan_out->skip, listener))
+    return;
 
   /* Guarantee caps reach the listener before its first buffer. A listener
    * that attached before this node had caps (e.g. a consumer pipeline started
@@ -1113,54 +1163,61 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
    * is_negotiated is a cheap flag (no downstream caps query) that resets on
    * every (re)attach, so this primes once per attachment instead of paying a
    * caps query per buffer. */
-  if (caps && !gst_inter_pipe_ilistener_is_negotiated (listener)) {
+  if (fan_out->caps && !gst_inter_pipe_ilistener_is_negotiated (listener)) {
     GST_INFO_OBJECT (sink, "Listener %s has no caps yet; applying node caps "
-        "%" GST_PTR_FORMAT " before its first buffer", listener_name, caps);
-    gst_inter_pipe_ilistener_set_caps (listener, caps);
+        "%" GST_PTR_FORMAT " before its first buffer", listener_name,
+        fan_out->caps);
+    gst_inter_pipe_ilistener_set_caps (listener, fan_out->caps);
   }
 
-  GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", buffer, listener_name);
+  GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", fan_out->buffer,
+      listener_name);
 
-  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, ctx->basetime))
+  if (!gst_inter_pipe_ilistener_push_buffer (listener,
+          gst_buffer_ref (fan_out->buffer), fan_out->basetime))
     GST_DEBUG_OBJECT (sink, "Listener %s did not accept the buffer",
         listener_name);
+  else if (fan_out->accepted)
+    g_hash_table_add (fan_out->accepted, listener);
 }
 
+/* Forward the sample's buffer to every listener not in skip (may be NULL),
+ * recording in accepted (may be NULL) those that took it. Takes ownership of
+ * the sample. */
 static void
-gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
+gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample,
+    GHashTable * skip, GHashTable * accepted)
 {
-  GHashTable *listeners;
-  GstBuffer *buffer;
-  struct PushSampleCtx ctx;
+  GstInterPipeSinkFanOut fan_out = { NULL, };
 
-  g_mutex_lock (&sink->listeners_mutex);
-  listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
-
-  buffer = gst_sample_get_buffer (sample);
-  if (!buffer) {
+  fan_out.sink = sink;
+  fan_out.buffer = gst_sample_get_buffer (sample);
+  if (!fan_out.buffer) {
     GST_LOG_OBJECT (sink, "Sample carries no buffer, nothing to forward");
     gst_sample_unref (sample);
-    g_mutex_unlock (&sink->listeners_mutex);
     return;
   }
-
-  /* Update last_buffer_timestamp */
-  sink->last_buffer_timestamp = GST_BUFFER_PTS (buffer);
-
-  GST_LOG_OBJECT (sink, "Received new buffer %p on node %s", buffer,
-      sink->node_name);
-
-  ctx.sink = sink;
-  ctx.buffer = buffer;
   /* Sample carries the negotiated caps; push_to_listener uses them to set caps
    * on any listener that attached before this node had caps. */
-  ctx.caps = gst_sample_get_caps (sample);
-  ctx.basetime = gst_element_get_base_time (GST_ELEMENT (sink));
-  g_hash_table_foreach (listeners, gst_inter_pipe_sink_push_to_listener, &ctx);
-  gst_sample_unref (sample);
+  fan_out.caps = gst_sample_get_caps (sample);
+  fan_out.skip = skip;
+  fan_out.accepted = accepted;
+
+  g_mutex_lock (&sink->listeners_mutex);
+
+  /* Update last_buffer_timestamp */
+  sink->last_buffer_timestamp = GST_BUFFER_PTS (fan_out.buffer);
+
+  GST_LOG_OBJECT (sink, "Received new buffer %p on node %s", fan_out.buffer,
+      sink->node_name);
+
+  fan_out.basetime = gst_element_get_base_time (GST_ELEMENT (sink));
+  g_hash_table_foreach (GST_INTER_PIPE_SINK_LISTENERS (sink),
+      gst_inter_pipe_sink_push_to_listener, &fan_out);
 
   g_mutex_unlock (&sink->listeners_mutex);
 
+  gst_sample_unref (sample);
 }
 
 static GstFlowReturn
@@ -1168,26 +1225,104 @@ gst_inter_pipe_sink_new_buffer (GstAppSink * asink, gpointer data)
 {
   GstInterPipeSink *sink;
   GstSample *sample;
+  GstBuffer *buffer;
+  GHashTable *skip = NULL;
 
   sink = GST_INTER_PIPE_SINK (asink);
 
   sample = gst_app_sink_pull_sample (asink);
-  gst_inter_pipe_sink_process_sample (sink, sample);
+  if (!sample)
+    return GST_FLOW_OK;
+
+  /* The buffer new_preroll forwarded while the pipeline was staying paused is
+   * rendered again once it resumes: leave out the listeners that already have
+   * it, but still give it to those that do not. */
+  buffer = gst_sample_get_buffer (sample);
+  GST_OBJECT_LOCK (sink);
+  if (buffer && buffer == sink->preroll_buffer) {
+    skip = sink->preroll_listeners;
+    sink->preroll_listeners = NULL;
+  }
+  gst_inter_pipe_sink_clear_preroll (sink);
+  GST_OBJECT_UNLOCK (sink);
+
+  if (skip)
+    GST_LOG_OBJECT (sink, "Buffer %p was forwarded at preroll to %u "
+        "listener(s), not forwarding it to them again", buffer,
+        g_hash_table_size (skip));
+
+  gst_inter_pipe_sink_process_sample (sink, sample, skip, NULL);
+  if (skip)
+    g_hash_table_destroy (skip);
 
   return GST_FLOW_OK;
 }
 
+
+/* Whether the pipeline this sink belongs to is headed for a state below
+ * PLAYING, so the buffer prerolled now will not be rendered soon. */
+static gboolean
+gst_inter_pipe_sink_staying_paused (GstInterPipeSink * sink)
+{
+  GstObject *top;
+  GstObject *parent;
+  GstState target;
+
+  top = gst_object_ref (GST_OBJECT (sink));
+  while ((parent = gst_object_get_parent (top)) != NULL) {
+    gst_object_unref (top);
+    top = parent;
+  }
+
+  GST_OBJECT_LOCK (top);
+  target = GST_STATE_TARGET (top);
+  GST_OBJECT_UNLOCK (top);
+  gst_object_unref (top);
+
+  return target < GST_STATE_PLAYING;
+}
 
 static GstFlowReturn
 gst_inter_pipe_sink_new_preroll (GstAppSink * asink, gpointer data)
 {
   GstInterPipeSink *sink;
   GstSample *sample;
+  GstBuffer *buffer;
+  GHashTable *accepted;
 
   sink = GST_INTER_PIPE_SINK (asink);
 
   sample = gst_app_sink_pull_preroll (asink);
-  gst_inter_pipe_sink_process_sample (sink, sample);
+  if (!sample)
+    return GST_FLOW_OK;
+
+  /* GstBaseSink prerolls a buffer before waiting for its clock time, and then
+   * renders the same buffer once that time comes. The render is the on-time
+   * hand-over, made with the pipeline PLAYING and its base time valid, which
+   * compensate-ts relies on. So forward at render, except when the pipeline
+   * is staying paused and will not render: forward the preroll buffer then,
+   * so listeners get it, and remember which listeners took it so that the
+   * render after a resume gives it only to the others. */
+  if (!gst_inter_pipe_sink_staying_paused (sink)) {
+    gst_sample_unref (sample);
+    return GST_FLOW_OK;
+  }
+
+  buffer = gst_sample_get_buffer (sample);
+  if (!buffer) {
+    gst_sample_unref (sample);
+    return GST_FLOW_OK;
+  }
+  gst_buffer_ref (buffer);
+
+  accepted = g_hash_table_new (g_direct_hash, g_direct_equal);
+  gst_inter_pipe_sink_process_sample (sink, sample, NULL, accepted);
+
+  GST_OBJECT_LOCK (sink);
+  gst_inter_pipe_sink_clear_preroll (sink);
+  sink->preroll_buffer = buffer;
+  sink->preroll_listeners = accepted;
+  GST_OBJECT_UNLOCK (sink);
 
   return GST_FLOW_OK;
 }
@@ -1390,6 +1525,10 @@ gst_inter_pipe_sink_remove_listener (GstInterPipeINode * iface,
 
   if (!g_hash_table_remove (listeners, listener))
     goto not_registered;
+  GST_OBJECT_LOCK (sink);
+  if (sink->preroll_listeners)
+    g_hash_table_remove (sink->preroll_listeners, listener);
+  GST_OBJECT_UNLOCK (sink);
 
   if (0 == g_hash_table_size (listeners) && sink->caps_negotiated) {
     gst_caps_unref (sink->caps_negotiated);
