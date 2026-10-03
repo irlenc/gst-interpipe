@@ -102,8 +102,6 @@ static gboolean gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink *
     sink, GstCaps * listener_caps, GstCaps * sinkcaps);
 static GstCaps *gst_inter_pipe_sink_caps_intersect (GstCaps * caps1,
     GstCaps * caps2);
-static void gst_inter_pipe_sink_intersect_listener_caps (gpointer key,
-    gpointer value, gpointer user_data);
 static void gst_inter_pipe_sink_forward_event (gpointer key, gpointer value,
     gpointer user_data);
 
@@ -155,6 +153,12 @@ struct _GstInterPipeSink
    * lock. */
   GstBuffer *preroll_buffer;
   GHashTable *preroll_listeners;
+
+  /* Listeners that set_caps could not give the newly negotiated caps (they
+   * attached after get_caps computed them). Their buffers are dropped until
+   * the renegotiation set_caps requested runs. Borrowed pointers, removed in
+   * remove_listener. Guarded by listeners_mutex. */
+  GHashTable *awaiting_caps;
 
   GMutex listeners_mutex;
 };
@@ -264,6 +268,7 @@ gst_inter_pipe_sink_init (GstInterPipeSink * sink)
   sink->last_buffer_timestamp = 0;
   sink->preroll_buffer = NULL;
   sink->preroll_listeners = NULL;
+  sink->awaiting_caps = g_hash_table_new (g_direct_hash, g_direct_equal);
 
   /* These change how long after its running time this sink hands a buffer
    * over, which listeners report as latency. */
@@ -450,35 +455,13 @@ gst_inter_pipe_sink_finalize (GObject * object)
   gst_inter_pipe_sink_clear_preroll (sink);
 
   g_hash_table_destroy (sink->listeners);
+  g_hash_table_destroy (sink->awaiting_caps);
 
   g_mutex_clear (&sink->listeners_mutex);
 
   /* Chain up to the parent class */
   G_OBJECT_CLASS (gst_inter_pipe_sink_parent_class)->finalize (object);
 }
-
-static void
-gst_inter_pipe_sink_update_listener_caps (gpointer key, gpointer data,
-    gpointer user_data)
-{
-  GstInterPipeIListener *listener;
-  GstAppSink *appsink;
-  gchar *listener_name;
-  GstCaps *caps;
-  gpointer *data_array = user_data;
-
-  appsink = GST_APP_SINK (data_array[0]);
-  caps = GST_CAPS (data_array[1]);
-
-  listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
-
-  GST_LOG_OBJECT (appsink, "Setting caps %" GST_PTR_FORMAT " to %s",
-      caps, listener_name);
-
-  gst_inter_pipe_ilistener_set_caps (listener, caps);
-}
-
 
 static gboolean
 gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink * sink,
@@ -519,142 +502,222 @@ gst_inter_pipe_sink_caps_intersect (GstCaps * caps1, GstCaps * caps2)
   return gst_caps_intersect (caps1, caps2);
 }
 
-static void
-gst_inter_pipe_sink_intersect_listener_caps (gpointer key, gpointer value,
-    gpointer user_data)
+/* A listener and the caps its downstream accepts, as queried by
+ * gst_inter_pipe_sink_query_listener_caps. */
+typedef struct
 {
-  GstInterPipeSink *sink;
   GstInterPipeIListener *listener;
-  GstCaps *caps_listener;
-  GstCaps *caps_intersection;
-  gboolean src_negotiated;
+  GstCaps *caps;
+  gboolean primed;
+} GstInterPipeSinkListenerCaps;
 
-  sink = GST_INTER_PIPE_SINK (user_data);
-  listener = GST_INTER_PIPE_ILISTENER (value);
+/* Snapshot the registered listeners (only those still waiting for caps when
+ * only_unprimed is set), holding a ref on each, and ask each one which caps its
+ * downstream accepts. The caps queries go to other pipelines' pads, which can
+ * block or come back into this element, so they run without listeners_mutex:
+ * the lock is held only while copying the table. Free the result with
+ * gst_inter_pipe_sink_free_listener_caps. */
+static GArray *
+gst_inter_pipe_sink_query_listener_caps (GstInterPipeSink * sink,
+    gboolean only_unprimed)
+{
+  GArray *entries;
+  GHashTableIter iter;
+  gpointer value;
+  guint i;
 
-  caps_listener = NULL;
-  caps_intersection = NULL;
+  entries = g_array_new (FALSE, TRUE, sizeof (GstInterPipeSinkListenerCaps));
 
-  caps_listener = gst_inter_pipe_ilistener_get_caps (listener, &src_negotiated);
-  GST_INFO_OBJECT (sink, "Listener %s caps: %" GST_PTR_FORMAT,
-      GST_OBJECT_NAME (listener), caps_listener);
+  g_mutex_lock (&sink->listeners_mutex);
+  g_hash_table_iter_init (&iter, GST_INTER_PIPE_SINK_LISTENERS (sink));
+  while (g_hash_table_iter_next (&iter, NULL, &value)) {
+    GstInterPipeSinkListenerCaps entry = { NULL, NULL, FALSE };
 
-  caps_intersection =
-      gst_inter_pipe_sink_caps_intersect (caps_listener, sink->caps_negotiated);
+    entry.primed = gst_inter_pipe_ilistener_is_negotiated (value);
+    if (only_unprimed && entry.primed)
+      continue;
+    entry.listener = gst_object_ref (value);
+    g_array_append_val (entries, entry);
+  }
+  g_mutex_unlock (&sink->listeners_mutex);
 
-  /* Replace old intersection with new one */
-  if (sink->caps_negotiated) {
-    gst_caps_unref (sink->caps_negotiated);
+  for (i = 0; i < entries->len; i++) {
+    GstInterPipeSinkListenerCaps *entry =
+        &g_array_index (entries, GstInterPipeSinkListenerCaps, i);
+    gboolean negotiated;
+
+    entry->caps = gst_inter_pipe_ilistener_get_caps (entry->listener,
+        &negotiated);
+    GST_INFO_OBJECT (sink, "Listener %s caps: %" GST_PTR_FORMAT,
+        gst_inter_pipe_ilistener_get_name (entry->listener), entry->caps);
   }
 
-  sink->caps_negotiated = caps_intersection;
-  /* get_caps may legitimately return NULL (e.g. a peer caps query yielding
-   * nothing while renegotiation is allowed). */
-  if (caps_listener)
-    gst_caps_unref (caps_listener);
+  return entries;
+}
+
+static void
+gst_inter_pipe_sink_free_listener_caps (GArray * entries)
+{
+  guint i;
+
+  for (i = 0; i < entries->len; i++) {
+    GstInterPipeSinkListenerCaps *entry =
+        &g_array_index (entries, GstInterPipeSinkListenerCaps, i);
+
+    gst_object_unref (entry->listener);
+    if (entry->caps)
+      gst_caps_unref (entry->caps);
+  }
+  g_array_free (entries, TRUE);
+}
+
+static const GstInterPipeSinkListenerCaps *
+gst_inter_pipe_sink_find_listener_caps (GArray * entries,
+    GstInterPipeIListener * listener)
+{
+  guint i;
+
+  for (i = 0; entries && i < entries->len; i++) {
+    const GstInterPipeSinkListenerCaps *entry =
+        &g_array_index (entries, GstInterPipeSinkListenerCaps, i);
+
+    if (entry->listener == listener)
+      return entry;
+  }
+  return NULL;
+}
+
+/* Detach each listener in the list from this node and release the list. Must
+ * be called without listeners_mutex: leaving re-enters this element through
+ * remove_listener. */
+static void
+gst_inter_pipe_sink_detach_listeners (GstInterPipeSink * sink, GList * evict)
+{
+  GList *l;
+
+  for (l = evict; l != NULL; l = l->next) {
+    GstInterPipeIListener *listener = l->data;
+
+    GST_WARNING_OBJECT (sink, "Detaching listener %s: no caps it accepts can "
+        "be negotiated on this node", gst_inter_pipe_ilistener_get_name
+        (listener));
+    if (!gst_inter_pipe_leave_node (listener))
+      GST_WARNING_OBJECT (listener, "Unable to remove listener from node");
+    gst_object_unref (listener);
+  }
+  g_list_free (evict);
 }
 
 static GstCaps *
 gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
 {
   GstInterPipeSink *sink;
-  GHashTable *listeners;
-  GstCaps *intercept_caps = NULL;
+  GArray *entries;
+  GstCaps *negotiated = NULL;
+  GstCaps *result = NULL;
   GstCaps *failed_caps = NULL;
-  GList *listeners_list;
-  GList *l;
+  GList *evict = NULL;
+  gboolean detach_all = FALSE;
+  gint pass;
+  guint i;
 
   sink = GST_INTER_PIPE_SINK (base);
 
-  /* The listeners table and caps_negotiated are read and written under the
-   * lock for the whole negotiation; both are mutated concurrently by
-   * add/remove_listener and set_caps. */
-  g_mutex_lock (&sink->listeners_mutex);
-  listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
-
-  if (0 == g_hash_table_size (listeners)) {
+  entries = gst_inter_pipe_sink_query_listener_caps (sink, FALSE);
+  if (0 == entries->len) {
     GST_INFO_OBJECT (sink, "No listeners yet, accepting any caps");
-    if (filter)
-      filter = gst_caps_ref (filter);
-    g_mutex_unlock (&sink->listeners_mutex);
-    return filter;
+    gst_inter_pipe_sink_free_listener_caps (entries);
+    return filter ? gst_caps_ref (filter) : NULL;
   }
 
-  /* Recompute from scratch: intersect_listener_caps folds each listener into
-   * the existing caps_negotiated, so a stale value left from a previous
-   * negotiation could only ever narrow the result (a listener that renegotiated
-   * to broader caps could never widen it back). Clear it first. */
-  if (sink->caps_negotiated) {
-    gst_caps_unref (sink->caps_negotiated);
-    sink->caps_negotiated = NULL;
+  /* Intersect the listeners' caps, those already receiving buffers first and
+   * then those still waiting for caps. A listener whose caps would empty the
+   * intersection is detached on its own, so a consumer that can never be
+   * served (attached late, or simply misconfigured) does not take the node
+   * down for the listeners already running. */
+  for (pass = 0; pass < 2; pass++) {
+    for (i = 0; i < entries->len; i++) {
+      GstInterPipeSinkListenerCaps *entry =
+          &g_array_index (entries, GstInterPipeSinkListenerCaps, i);
+      GstCaps *candidate;
+
+      if (entry->primed != (pass == 0) || !entry->caps)
+        continue;
+
+      candidate = gst_inter_pipe_sink_caps_intersect (entry->caps, negotiated);
+      if (gst_caps_is_empty (candidate)) {
+        GST_WARNING_OBJECT (sink, "Listener %s caps %" GST_PTR_FORMAT
+            " do not intersect the other listeners' %" GST_PTR_FORMAT,
+            gst_inter_pipe_ilistener_get_name (entry->listener), entry->caps,
+            negotiated);
+        evict = g_list_prepend (evict, gst_object_ref (entry->listener));
+        gst_caps_unref (candidate);
+        continue;
+      }
+      if (negotiated)
+        gst_caps_unref (negotiated);
+      negotiated = candidate;
+    }
   }
 
-  /* Intersect the caps of every listener into sink->caps_negotiated. */
-  g_hash_table_foreach (listeners, gst_inter_pipe_sink_intersect_listener_caps,
-      sink);
-
-  if (sink->caps_negotiated && !gst_caps_is_empty (sink->caps_negotiated)) {
-    GST_INFO_OBJECT (sink, "Caps negotiated: %" GST_PTR_FORMAT,
-        sink->caps_negotiated);
+  if (negotiated) {
+    GST_INFO_OBJECT (sink, "Caps negotiated: %" GST_PTR_FORMAT, negotiated);
     /* Take into account the upstream caps suggestion. */
-    intercept_caps =
-        gst_inter_pipe_sink_caps_intersect (sink->caps_negotiated, filter);
-    GST_INFO_OBJECT (sink, "Filtered caps: %" GST_PTR_FORMAT, intercept_caps);
-  } else {
-    GST_ERROR_OBJECT (sink,
-        "Failed to obtain an intersection between listener caps");
+    result = gst_inter_pipe_sink_caps_intersect (negotiated, filter);
+    GST_INFO_OBJECT (sink, "Filtered caps: %" GST_PTR_FORMAT, result);
+    if (gst_caps_is_empty (result)) {
+      gst_caps_unref (result);
+      result = NULL;
+    }
   }
 
-  if (intercept_caps && !gst_caps_is_empty (intercept_caps)) {
-    g_mutex_unlock (&sink->listeners_mutex);
-    return intercept_caps;
-  }
-
-  if (intercept_caps) {
+  if (!result) {
+    /* Nothing upstream can produce is accepted by the listeners that are
+     * left, or none of them reported caps: there is no single listener to
+     * blame, so detach them all and start over. */
     GST_ERROR_OBJECT (sink, "Failed to obtain an intersection between "
         "upstream elements and listeners");
-    gst_caps_unref (intercept_caps);
+    for (i = 0; i < entries->len; i++) {
+      GstInterPipeIListener *listener =
+          g_array_index (entries, GstInterPipeSinkListenerCaps, i).listener;
+
+      if (!g_list_find (evict, listener))
+        evict = g_list_prepend (evict, gst_object_ref (listener));
+    }
+    detach_all = TRUE;
+    failed_caps = negotiated;
+    negotiated = NULL;
   }
 
-  /* No usable intersection: detach every listener and reset the negotiated
-   * caps. Snapshot the listeners holding a ref each, drop the lock, then call
-   * leave_node, which re-enters this element through remove_listener and would
-   * deadlock if called under the lock.
-   *
-   * This is terminal, not transient. A detached listener leaves the registry's
-   * listener table, so it is never notified when this node republishes: every
-   * consumer of this node is disconnected for good, and the only signal used to
-   * be a GST_ERROR line in the log. Post it on the bus so a supervisor sees the
-   * producer fail and rebuilds it, rather than watching every consumer of a
-   * live-looking pipeline quietly freeze. The post happens after the unlock,
-   * like the leave_node calls and for the same reason. */
-  listeners_list = g_hash_table_get_values (listeners);
-  for (l = listeners_list; l != NULL; l = l->next)
-    gst_object_ref (l->data);
-
-  if (sink->caps_negotiated) {
-    failed_caps = sink->caps_negotiated;
-    sink->caps_negotiated = NULL;
-  }
+  g_mutex_lock (&sink->listeners_mutex);
+  gst_caps_replace (&sink->caps_negotiated, negotiated);
   g_mutex_unlock (&sink->listeners_mutex);
+  if (negotiated)
+    gst_caps_unref (negotiated);
 
-  GST_ELEMENT_ERROR (sink, STREAM, FORMAT,
-      ("No caps intersection between this node and its listeners; every "
-          "listener has been detached"),
-      ("negotiated %" GST_PTR_FORMAT ", filter %" GST_PTR_FORMAT, failed_caps,
-          filter));
+  /* Detaching every listener is terminal, not transient. A detached listener
+   * leaves the registry's listener table, so it is never notified when this
+   * node republishes: every consumer of this node is disconnected for good.
+   * Post it on the bus so a supervisor sees the producer fail and rebuilds it,
+   * rather than watching every consumer of a live-looking pipeline quietly
+   * freeze. A single listener evicted above is not reported here: the node
+   * keeps serving the others, and failing the producer would take them down
+   * too. Posted after the unlock, like the leave_node calls in
+   * detach_listeners, which re-enter this element through remove_listener. */
+  if (detach_all) {
+    GST_ELEMENT_ERROR (sink, STREAM, FORMAT,
+        ("No caps intersection between this node and its listeners; every "
+            "listener has been detached"),
+        ("negotiated %" GST_PTR_FORMAT ", filter %" GST_PTR_FORMAT,
+            failed_caps, filter));
+  }
   if (failed_caps)
     gst_caps_unref (failed_caps);
 
-  for (l = listeners_list; l != NULL; l = l->next) {
-    GstInterPipeIListener *listener = l->data;
-    if (!gst_inter_pipe_leave_node (listener))
-      GST_WARNING_OBJECT (listener, "Unable to remove listener from node");
-    gst_object_unref (listener);
-  }
-  g_list_free (listeners_list);
+  gst_inter_pipe_sink_free_listener_caps (entries);
+  gst_inter_pipe_sink_detach_listeners (sink, evict);
 
-  return NULL;
+  return result;
 }
 
 static gboolean
@@ -662,7 +725,11 @@ gst_inter_pipe_sink_set_caps (GstBaseSink * base, GstCaps * caps)
 {
   GstInterPipeSink *sink;
   GHashTable *listeners;
+  GArray *entries;
   gboolean ret = TRUE;
+  gboolean compatible;
+  gboolean reconfigure = FALSE;
+  guint i;
 
   sink = GST_INTER_PIPE_SINK (base);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
@@ -684,25 +751,56 @@ gst_inter_pipe_sink_set_caps (GstBaseSink * base, GstCaps * caps)
     g_mutex_unlock (&sink->listeners_mutex);
     goto out;
   }
+  compatible = sink->caps_negotiated
+      && gst_caps_can_intersect (sink->caps_negotiated, caps);
+  g_mutex_unlock (&sink->listeners_mutex);
 
-  if (sink->caps_negotiated
-      && (gst_caps_can_intersect (sink->caps_negotiated, caps))) {
-    gpointer data[2];
-
-    data[0] = sink;
-    data[1] = caps;
-    g_hash_table_foreach (listeners, gst_inter_pipe_sink_update_listener_caps,
-        data);
-
-    GST_INFO_OBJECT (sink, "Listeners caps updated");
-  } else {
+  if (!compatible) {
     GST_WARNING_OBJECT (sink,
         "There's not caps intersection between node %s and listeners. Caps won't be set",
         sink->node_name);
     ret = FALSE;
+    goto out;
   }
 
+  /* These caps were negotiated against the listeners registered when get_caps
+   * ran. A listener that attached since then may not be able to take them:
+   * do not give them to it, drop its buffers, and have upstream renegotiate
+   * with it folded in, rather than fail its pipeline with not-negotiated. */
+  entries = gst_inter_pipe_sink_query_listener_caps (sink, FALSE);
+  g_mutex_lock (&sink->listeners_mutex);
+  g_hash_table_remove_all (sink->awaiting_caps);
+  for (i = 0; i < entries->len; i++) {
+    GstInterPipeSinkListenerCaps *entry =
+        &g_array_index (entries, GstInterPipeSinkListenerCaps, i);
+
+    if (!g_hash_table_contains (listeners, entry->listener))
+      continue;
+
+    if (entry->caps && !gst_caps_can_intersect (entry->caps, caps)) {
+      GST_INFO_OBJECT (sink, "Caps %" GST_PTR_FORMAT " do not intersect "
+          "listener %s caps %" GST_PTR_FORMAT ", dropping its buffers until "
+          "upstream renegotiates", caps,
+          gst_inter_pipe_ilistener_get_name (entry->listener), entry->caps);
+      g_hash_table_add (sink->awaiting_caps, entry->listener);
+      reconfigure = TRUE;
+      continue;
+    }
+
+    GST_LOG_OBJECT (sink, "Setting caps %" GST_PTR_FORMAT " to %s", caps,
+        gst_inter_pipe_ilistener_get_name (entry->listener));
+    gst_inter_pipe_ilistener_set_caps (entry->listener, caps);
+  }
   g_mutex_unlock (&sink->listeners_mutex);
+  gst_inter_pipe_sink_free_listener_caps (entries);
+  GST_INFO_OBJECT (sink, "Listeners caps updated");
+
+  /* Outside the lock: upstream answers by querying this sink's caps, and
+   * get_caps takes the listeners lock. */
+  if (reconfigure
+      && !gst_pad_push_event (GST_INTER_PIPE_SINK_PAD (sink),
+          gst_event_new_reconfigure ()))
+    GST_WARNING_OBJECT (sink, "Failed to request upstream renegotiation");
 
  out:
   if (ret) {
@@ -1128,13 +1226,17 @@ typedef struct
   GstInterPipeSink *sink;
   GstBuffer *buffer;
   GstCaps *caps;
-  /* Read once per sample: it is the same for every listener in the fan-out and
-   * reading it takes the sink's object lock. */
-  guint64 basetime;
+  /* Caps of the listeners still waiting for caps, queried before taking
+   * listeners_mutex. NULL when every listener was primed. */
+  GArray *unprimed;
   /* Listeners to leave out (they already have this buffer), or NULL. */
   GHashTable *skip;
   /* Where to record the listeners that took the buffer, or NULL. */
   GHashTable *accepted;
+  /* Read once per sample: it is the same for every listener in the fan-out and
+   * reading it takes the sink's object lock. */
+  guint64 basetime;
+  gboolean reconfigure;
 } GstInterPipeSinkFanOut;
 
 static void
@@ -1152,18 +1254,40 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
   if (fan_out->skip && g_hash_table_contains (fan_out->skip, listener))
     return;
 
+  if (g_hash_table_contains (sink->awaiting_caps, listener)) {
+    GST_LOG_OBJECT (sink, "Dropping buffer for listener %s until upstream "
+        "renegotiates", listener_name);
+    return;
+  }
+
   /* Guarantee caps reach the listener before its first buffer. A listener
    * that attached before this node had caps (e.g. a consumer pipeline started
    * before a slow/network producer began producing) is otherwise pushed a
    * buffer with no caps set on its appsrc, which fails downstream
    * negotiation (not-negotiated). When the listener has no caps yet, set them
-   * from the current sample's caps first. Listeners that already have caps are
-   * left untouched, so allow-renegotiation behaviour is preserved.
+   * from the current sample's caps first, but only caps its downstream
+   * accepts; otherwise drop its buffers and have upstream renegotiate with it
+   * folded in. Listeners that already have caps are left untouched, so
+   * allow-renegotiation behaviour is preserved.
    *
-   * is_negotiated is a cheap flag (no downstream caps query) that resets on
-   * every (re)attach, so this primes once per attachment instead of paying a
-   * caps query per buffer. */
+   * is_negotiated is a cheap flag that resets on every (re)attach, so the
+   * caps query this needs is only paid while a listener is unprimed. */
   if (fan_out->caps && !gst_inter_pipe_ilistener_is_negotiated (listener)) {
+    const GstInterPipeSinkListenerCaps *entry =
+        gst_inter_pipe_sink_find_listener_caps (fan_out->unprimed, listener);
+
+    if (!entry) {
+      /* Attached after the caps check: decide on the next buffer. */
+      return;
+    }
+    if (entry->caps && !gst_caps_can_intersect (entry->caps, fan_out->caps)) {
+      GST_DEBUG_OBJECT (sink, "Node caps %" GST_PTR_FORMAT " do not intersect "
+          "listener %s caps %" GST_PTR_FORMAT ", dropping its buffers until "
+          "upstream renegotiates", fan_out->caps, listener_name, entry->caps);
+      fan_out->reconfigure = TRUE;
+      return;
+    }
+
     GST_INFO_OBJECT (sink, "Listener %s has no caps yet; applying node caps "
         "%" GST_PTR_FORMAT " before its first buffer", listener_name,
         fan_out->caps);
@@ -1189,6 +1313,9 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample,
     GHashTable * skip, GHashTable * accepted)
 {
   GstInterPipeSinkFanOut fan_out = { NULL, };
+  GHashTableIter iter;
+  gpointer value;
+  gboolean any_unprimed = FALSE;
 
   fan_out.sink = sink;
   fan_out.buffer = gst_sample_get_buffer (sample);
@@ -1202,6 +1329,19 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample,
   fan_out.caps = gst_sample_get_caps (sample);
   fan_out.skip = skip;
   fan_out.accepted = accepted;
+
+  /* Unprimed listeners need a caps query before they get caps, which must not
+   * run under listeners_mutex (see query_listener_caps). Only pay for it while
+   * some listener is unprimed. */
+  if (fan_out.caps) {
+    g_mutex_lock (&sink->listeners_mutex);
+    g_hash_table_iter_init (&iter, GST_INTER_PIPE_SINK_LISTENERS (sink));
+    while (!any_unprimed && g_hash_table_iter_next (&iter, NULL, &value))
+      any_unprimed = !gst_inter_pipe_ilistener_is_negotiated (value);
+    g_mutex_unlock (&sink->listeners_mutex);
+    if (any_unprimed)
+      fan_out.unprimed = gst_inter_pipe_sink_query_listener_caps (sink, TRUE);
+  }
 
   g_mutex_lock (&sink->listeners_mutex);
 
@@ -1217,7 +1357,16 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample,
 
   g_mutex_unlock (&sink->listeners_mutex);
 
+  if (fan_out.unprimed)
+    gst_inter_pipe_sink_free_listener_caps (fan_out.unprimed);
   gst_sample_unref (sample);
+
+  /* Outside the lock: upstream may answer a reconfigure by querying this
+   * sink's caps, and get_caps takes the listeners lock. */
+  if (fan_out.reconfigure
+      && !gst_pad_push_event (GST_INTER_PIPE_SINK_PAD (sink),
+          gst_event_new_reconfigure ()))
+    GST_WARNING_OBJECT (sink, "Failed to request upstream renegotiation");
 }
 
 static GstFlowReturn
@@ -1384,6 +1533,7 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
   const gchar *listener_name;
   GstCaps *srccaps, *sinkcaps;
   gboolean src_negotiated;
+  gboolean reconfigure = FALSE;
 
   g_return_val_if_fail (iface, FALSE);
   g_return_val_if_fail (listener, FALSE);
@@ -1439,14 +1589,27 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
         goto set_caps_failed;
     }
   } else {
-    /* If src has no caps, set it to caps from sink pad */
+    /* The listener has no caps yet. Prime it with the node's current caps
+     * when its downstream can take them. Otherwise leave it unprimed and have
+     * upstream renegotiate once the listener is registered: get_caps then
+     * folds its caps into the negotiation and set_caps delivers the result.
+     * Caps the listener cannot accept would only fail its pipeline with
+     * not-negotiated. */
     GstEvent *capsev = gst_pad_get_sticky_event (GST_INTER_PIPE_SINK_PAD (sink),
         GST_EVENT_CAPS, 0);
     if (capsev) {
       GstCaps *caps;
       gst_event_parse_caps (capsev, &caps);
-      GST_INFO_OBJECT (sink, "Setting listener caps to %" GST_PTR_FORMAT, caps);
-      gst_inter_pipe_ilistener_set_caps (listener, caps);
+      if (!srccaps || gst_caps_can_intersect (srccaps, caps)) {
+        GST_INFO_OBJECT (sink, "Setting listener caps to %" GST_PTR_FORMAT,
+            caps);
+        gst_inter_pipe_ilistener_set_caps (listener, caps);
+      } else {
+        GST_INFO_OBJECT (sink, "Node caps %" GST_PTR_FORMAT " do not intersect "
+            "listener %s caps %" GST_PTR_FORMAT ", renegotiating upstream",
+            caps, listener_name, srccaps);
+        reconfigure = TRUE;
+      }
       gst_event_unref (capsev);
     } else {
       GST_INFO_OBJECT (sink,
@@ -1469,6 +1632,15 @@ add_to_list:
   g_hash_table_insert (listeners, (gpointer) listener, gst_object_ref (listener));
 
   g_mutex_unlock (&sink->listeners_mutex);
+
+  /* Only now that the listener is in the table: the renegotiation this
+   * triggers runs get_caps on the producer's streaming thread, which has to
+   * see the new listener to fold its caps in. */
+  if (reconfigure
+      && !gst_pad_push_event (GST_INTER_PIPE_SINK_PAD (sink),
+          gst_event_new_reconfigure ()))
+    GST_WARNING_OBJECT (sink, "Failed to request upstream renegotiation "
+        "for listener %s", listener_name);
 
   return TRUE;
 
@@ -1525,6 +1697,7 @@ gst_inter_pipe_sink_remove_listener (GstInterPipeINode * iface,
 
   if (!g_hash_table_remove (listeners, listener))
     goto not_registered;
+  g_hash_table_remove (sink->awaiting_caps, listener);
   GST_OBJECT_LOCK (sink);
   if (sink->preroll_listeners)
     g_hash_table_remove (sink->preroll_listeners, listener);
