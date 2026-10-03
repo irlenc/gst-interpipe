@@ -1356,47 +1356,37 @@ static gboolean
 gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
 {
   GstInterPipeSink *self;
-  GHashTable *listeners;
   GstPad *sinkpad;
   const GstStructure *structure;
   gboolean is_force_key_unit;
-  guint num_listeners;
 
   self = GST_INTER_PIPE_SINK (iface);
-  listeners = GST_INTER_PIPE_SINK_LISTENERS (self);
 
-  /* A force-key-unit request is safe to forward even when several listeners
-   * share this node: the producer emits one extra keyframe, which every
-   * listener receives, for a small bitrate cost. Without this, a freshly
-   * attached consumer cannot ask for a keyframe and stays blank until the next
-   * periodic one. Every other upstream event stays confined to the
-   * single-listener case, so one consumer cannot disturb the others. */
+  /* Only the force-key-unit request crosses the node boundary: it is about
+   * stream content, which producer and consumers share, and broadcasting it
+   * is safe with any listener count (an extra keyframe costs a little
+   * bitrate and unblocks a freshly attached consumer). Every other upstream
+   * event type is pipeline-local: clocks (QOS, LATENCY), caps
+   * (RECONFIGURE), or playback position (SEEK), and does not translate
+   * across a boundary whose caps are frozen and whose buffer timestamps are
+   * rebased per listener; a consumer-originated RECONFIGURE in particular
+   * has deadlocked the producer's source in renegotiation. Dropped events
+   * return TRUE: the node has accepted and consumed them. */
   structure = gst_event_get_structure (event);
   is_force_key_unit = GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM
       && structure != NULL
       && gst_structure_has_name (structure, "GstForceKeyUnit");
 
-  /* add_listener and remove_listener mutate the table from other threads, so
-   * snapshot the count under the lock. The lock is released before pushing, so
-   * it is never held across gst_pad_push_event. */
-  g_mutex_lock (&self->listeners_mutex);
-  num_listeners = g_hash_table_size (listeners);
-  g_mutex_unlock (&self->listeners_mutex);
-
-  if (num_listeners != 1 && !is_force_key_unit) {
+  if (!is_force_key_unit) {
+    GST_DEBUG_OBJECT (self,
+        "Dropping upstream %s event: only force-key-unit crosses the "
+        "interpipe boundary", GST_EVENT_TYPE_NAME (event));
     gst_event_unref (event);
-    goto multiple_listeners;
+    return TRUE;
   }
 
   sinkpad = GST_INTER_PIPE_SINK_PAD (self);
   return gst_pad_push_event (sinkpad, event);
-
-multiple_listeners:
-  {
-    GST_WARNING_OBJECT (self, "Could not send event upstream, "
-        "more than one listener is connected");
-    return FALSE;
-  }
 }
 
 static gboolean
