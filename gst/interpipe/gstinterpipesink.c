@@ -90,6 +90,10 @@ static gboolean gst_inter_pipe_sink_set_caps (GstBaseSink * base,
     GstCaps * filter);
 static gboolean gst_inter_pipe_sink_event (GstBaseSink * base,
     GstEvent * event);
+static gboolean gst_inter_pipe_sink_send_event (GstElement * element,
+    GstEvent * event);
+static void gst_inter_pipe_sink_delay_changed (GObject * object,
+    GParamSpec * pspec, gpointer user_data);
 static gboolean gst_inter_pipe_sink_propose_allocation (GstBaseSink * base,
     GstQuery * query);
 static gboolean gst_inter_pipe_sink_query_is_raw_video (GstQuery * query);
@@ -198,6 +202,8 @@ gst_inter_pipe_sink_class_init (GstInterPipeSinkClass * klass)
   basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_get_caps);
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_set_caps);
   basesink_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_event);
+  element_class->send_event =
+      GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_send_event);
   basesink_class->propose_allocation =
       GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_propose_allocation);
 }
@@ -244,6 +250,15 @@ gst_inter_pipe_sink_init (GstInterPipeSink * sink)
   sink->forward_eos = FALSE;
   sink->forward_events = TRUE;
   sink->last_buffer_timestamp = 0;
+
+  /* These change how long after its running time this sink hands a buffer
+   * over, which listeners report as latency. */
+  g_signal_connect (sink, "notify::sync",
+      G_CALLBACK (gst_inter_pipe_sink_delay_changed), NULL);
+  g_signal_connect (sink, "notify::ts-offset",
+      G_CALLBACK (gst_inter_pipe_sink_delay_changed), NULL);
+  g_signal_connect (sink, "notify::render-delay",
+      G_CALLBACK (gst_inter_pipe_sink_delay_changed), NULL);
 
   g_mutex_init (&sink->listeners_mutex);
 
@@ -900,6 +915,47 @@ gst_inter_pipe_sink_query_is_raw_video (GstQuery * query)
   }
 
   return FALSE;
+}
+
+static void
+gst_inter_pipe_sink_notify_latency_changed (gpointer key, gpointer value,
+    gpointer user_data)
+{
+  gst_inter_pipe_ilistener_latency_changed (GST_INTER_PIPE_ILISTENER (value));
+}
+
+static void
+gst_inter_pipe_sink_latency_changed (GstInterPipeSink * sink)
+{
+  g_mutex_lock (&sink->listeners_mutex);
+  g_hash_table_foreach (GST_INTER_PIPE_SINK_LISTENERS (sink),
+      gst_inter_pipe_sink_notify_latency_changed, NULL);
+  g_mutex_unlock (&sink->listeners_mutex);
+}
+
+/* The bin configures this sink's latency with a LATENCY event; listeners
+ * report it downstream as their upstream latency, so tell them. */
+static gboolean
+gst_inter_pipe_sink_send_event (GstElement * element, GstEvent * event)
+{
+  GstInterPipeSink *sink = GST_INTER_PIPE_SINK (element);
+  gboolean is_latency = GST_EVENT_TYPE (event) == GST_EVENT_LATENCY;
+  gboolean ret;
+
+  ret = GST_ELEMENT_CLASS (gst_inter_pipe_sink_parent_class)->send_event
+      (element, event);
+
+  if (is_latency)
+    gst_inter_pipe_sink_latency_changed (sink);
+
+  return ret;
+}
+
+static void
+gst_inter_pipe_sink_delay_changed (GObject * object, GParamSpec * pspec,
+    gpointer user_data)
+{
+  gst_inter_pipe_sink_latency_changed (GST_INTER_PIPE_SINK (object));
 }
 
 static gboolean
