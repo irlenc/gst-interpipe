@@ -623,12 +623,26 @@ gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
    * and events are already shared. Everything else falls through to the
    * default GstBaseSrc handling. */
   if (GST_QUERY_TYPE (query) == GST_QUERY_CONTEXT) {
-    node = gst_inter_pipe_get_node (src->listen_to);
-    if (node && gst_inter_pipe_inode_receive_query (node, query)) {
-      GST_DEBUG_OBJECT (src,
-          "Answered %s query across the interpipe boundary",
-          GST_QUERY_TYPE_NAME (query));
-      return TRUE;
+    gboolean answered;
+    gchar *listen_to;
+
+    /* Snapshot listen_to under the object lock: a concurrent property set may
+     * be freeing it. */
+    GST_OBJECT_LOCK (src);
+    listen_to = g_strdup (src->listen_to);
+    GST_OBJECT_UNLOCK (src);
+
+    node = listen_to ? gst_inter_pipe_get_node (listen_to) : NULL;
+    g_free (listen_to);
+    if (node) {
+      answered = gst_inter_pipe_inode_receive_query (node, query);
+      gst_object_unref (node);
+      if (answered) {
+        GST_DEBUG_OBJECT (src,
+            "Answered %s query across the interpipe boundary",
+            GST_QUERY_TYPE_NAME (query));
+        return TRUE;
+      }
     }
   }
 
