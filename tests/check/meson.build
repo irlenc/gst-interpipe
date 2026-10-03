@@ -6,6 +6,7 @@ core_tests = [
   [ 'gst/test_caps_renegotiation.c' ],
   [ 'gst/test_context_query.c' ],
   [ 'gst/test_cold_attach.c' ],
+  [ 'gst/test_flush_forwarding.c' ],
   [ 'gst/test_force_key_unit_event.c' ],
   [ 'gst/test_stream_sync.c' ],
   [ 'gst/test_stream_sync_retiming.c' ],

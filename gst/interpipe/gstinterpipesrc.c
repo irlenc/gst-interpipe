@@ -106,8 +106,8 @@ static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
 static GstClockTime gst_inter_pipe_src_node_latency (GstInterPipeSrc * src);
 static void gst_inter_pipe_src_request_latency_recalculation (GstInterPipeSrc *
     src);
-static GstEvent *gst_inter_pipe_src_restart_ts_segment (GstInterPipeSrc *
-    src, GstEvent * producer);
+static gboolean gst_inter_pipe_src_forward_flush (GstInterPipeSrc * src,
+    GstEvent * event);
 static void gst_inter_pipe_src_latency_changed (GstInterPipeIListener * iface);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
@@ -179,12 +179,6 @@ struct _GstInterPipeSrc
    * teardown may be disposing. Atomic: written from the state-change thread,
    * read on the streaming thread. */
   gint flushing;
-
-  /* Set when create() forwarded the producer's FLUSH_STOP, which removes the
-   * sticky segment downstream, until a segment restores one. Only restart-ts
-   * reads it (see gst_inter_pipe_src_restart_ts_segment). Streaming thread
-   * only. */
-  gboolean segment_flushed;
 
   /* Block switch */
   gboolean block_switch;
@@ -333,7 +327,6 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->accept_events = TRUE;
   src->accept_eos_event = TRUE;
   src->flushing = 0;
-  src->segment_flushed = FALSE;
 }
 
 static void
@@ -554,9 +547,6 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
 
   if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync)
     gst_base_src_set_do_timestamp (base, TRUE);
-
-  /* The base class sends a fresh segment after start. */
-  src->segment_flushed = FALSE;
 
   return TRUE;
 start_fail:
@@ -863,16 +853,28 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
     /* passthrough-ts keeps the producer's timestamps and compensate-ts only
      * moves them by the base-time difference, so in both the producer's
      * segment is the one their buffers belong to and goes downstream in its
-     * place. restart-ts re-stamps the buffers onto this element's timeline. */
+     * place.
+     *
+     * restart-ts re-stamps every buffer with this element's running time, so
+     * the producer's segment describes a timeline these buffers no longer use,
+     * and appsrc's own TIME segment is the one that describes what leaves this
+     * pad. Forwarding the producer's segment would put a second segment
+     * downstream after that one, and downstream keeps the last: when the
+     * producer's segment does not start at 0 (a VA decoder publishing into a
+     * hop, or an encoder that offsets its timeline so DTS never goes negative)
+     * every re-stamped buffer then falls outside it and the next sink clips
+     * the whole stream away without a word. Measured on a VA decoder feeding a
+     * hop: 602 buffers published, 602 dequeued here, 601 dropped by the
+     * consumer's sink as "out of clipping segment". So it is dropped. After a
+     * forwarded flush appsrc restores its own segment before the next buffer
+     * (see gst_inter_pipe_src_forward_flush). */
     if (GST_EVENT_TYPE (serial_event) == GST_EVENT_SEGMENT
         && GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync) {
-      serial_event = gst_inter_pipe_src_restart_ts_segment (src, serial_event);
-      if (!serial_event)
-        continue;
+      GST_DEBUG_OBJECT (src, "Dropping the producer's %" GST_PTR_FORMAT
+          "; this element's own segment describes its output", serial_event);
+      gst_event_unref (serial_event);
+      continue;
     }
-
-    if (GST_EVENT_TYPE (serial_event) == GST_EVENT_FLUSH_STOP)
-      src->segment_flushed = TRUE;
 
     GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
         GST_EVENT_TYPE_NAME (serial_event));
@@ -880,53 +882,6 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   }
 
   return ret;
-}
-
-/* restart-ts re-stamps every buffer with this element's running time, so the
- * producer's segment describes a timeline these buffers no longer use, and
- * appsrc's own TIME segment is the one that describes what leaves this pad.
- * Forwarding the producer's segment would put a second segment downstream
- * after that one, and downstream keeps the last: when the producer's segment
- * does not start at 0 (a VA decoder publishing into a hop, or an encoder that
- * offsets its timeline so DTS never goes negative) every re-stamped buffer
- * then falls outside it and the next sink clips the whole stream away without
- * a word. Measured on a VA decoder feeding a hop: 602 buffers published, 602
- * dequeued here, 601 dropped by the consumer's sink as "out of clipping
- * segment".
- *
- * So the producer's segment is dropped, with one exception. A FLUSH_STOP this
- * element forwarded clears the sticky segment downstream, and appsrc does not
- * send another one for a flush it did not see: the producer's segment after
- * it is then the only thing that restores one. In that case send this
- * element's own segment in its place, keeping the producer's seqnum.
- *
- * Takes ownership of the producer's segment event and returns the event to
- * push, or NULL when there is nothing to push. Streaming thread only. */
-static GstEvent *
-gst_inter_pipe_src_restart_ts_segment (GstInterPipeSrc * src,
-    GstEvent * producer)
-{
-  GstBaseSrc *base = GST_BASE_SRC (src);
-  GstEvent *own;
-
-  if (!src->segment_flushed) {
-    GST_DEBUG_OBJECT (src, "Dropping the producer's %" GST_PTR_FORMAT
-        "; this element's own segment describes its output", producer);
-    gst_event_unref (producer);
-    return NULL;
-  }
-  src->segment_flushed = FALSE;
-
-  GST_OBJECT_LOCK (src);
-  own = gst_event_new_segment (&base->segment);
-  GST_OBJECT_UNLOCK (src);
-
-  gst_event_set_seqnum (own, gst_event_get_seqnum (producer));
-  GST_DEBUG_OBJECT (src, "Replacing producer %" GST_PTR_FORMAT " with %"
-      GST_PTR_FORMAT, producer, own);
-  gst_event_unref (producer);
-
-  return own;
 }
 
 static void
@@ -1238,6 +1193,83 @@ nosync:
 
 }
 
+/* After a flush the serial events still pending were queued around buffers
+ * that appsrc has just discarded. Drop the ones a flush discards on a pad (the
+ * non-sticky ones, and the segment and EOS that FLUSH_STOP clears), keep the
+ * other sticky ones, and make those due before the next buffer. */
+static void
+gst_inter_pipe_src_discard_flushed (GstInterPipeSrc * src)
+{
+  GList *l, *next;
+
+  g_mutex_lock (&src->serial_events_lock);
+  src->buffers_queued = 0;
+  src->buffers_taken = 0;
+  for (l = src->pending_serial_events->head; l != NULL; l = next) {
+    GstInterPipeSrcSerialEvent *pending = l->data;
+    GstEventType type = GST_EVENT_TYPE (pending->event);
+
+    next = l->next;
+    if (!GST_EVENT_IS_STICKY (pending->event) || type == GST_EVENT_SEGMENT
+        || type == GST_EVENT_EOS) {
+      GST_DEBUG_OBJECT (src, "Discarding flushed %s",
+          GST_EVENT_TYPE_NAME (pending->event));
+      g_queue_delete_link (src->pending_serial_events, l);
+      gst_inter_pipe_src_serial_event_free (pending);
+    } else {
+      pending->after = 0;
+    }
+  }
+  g_mutex_unlock (&src->serial_events_lock);
+}
+
+/* The producer's flushes go through the base class's own flush handling, the
+ * one gst_element_send_event gives an application flushing a source from
+ * outside, rather than onto the source pad directly.
+ *
+ * A flush can land while the streaming thread is pushing a buffer. The push
+ * then returns FLUSHING and the base class pauses the streaming task, and
+ * only its FLUSH_STOP handling starts the task again. Pushed on the pad, or
+ * queued behind buffers for create() like any other serial event, a
+ * FLUSH_STOP never reaches that handling, and the consumer stays stopped for
+ * good. Through it, FLUSH_START unblocks the streaming thread, and FLUSH_STOP
+ * waits for the thread to leave, drops the buffers appsrc still holds from
+ * before the flush, pushes the event downstream and restarts the task.
+ *
+ * The FLUSH_STOP pushed downstream clears the segment there, and appsrc pushes
+ * its own before the next buffer it hands out. That is the segment restart-ts
+ * needs; in passthrough-ts and compensate-ts the producer's segment that
+ * follows the flush is due before that buffer and replaces it.
+ *
+ * Both flush events arrive on the thread that flushes the producer, never on
+ * this element's streaming thread, so waiting for that thread here is safe.
+ * Takes ownership of the event. */
+static gboolean
+gst_inter_pipe_src_forward_flush (GstInterPipeSrc * src, GstEvent * event)
+{
+  gboolean is_stop = GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP;
+  gboolean ret;
+
+  if (g_atomic_int_get (&src->flushing)) {
+    /* Teardown in progress: the base class is stopping its task anyway. */
+    gst_event_unref (event);
+    return TRUE;
+  }
+
+  GST_INFO_OBJECT (src, "Forwarding the producer's %s through the base class",
+      GST_EVENT_TYPE_NAME (event));
+
+  ret = gst_element_send_event (GST_ELEMENT (src), event);
+
+  /* Once FLUSH_STOP returns the streaming thread has been through the flush
+   * and the producer has not resumed yet (it is still delivering this event),
+   * so nothing can be queued against the old sequence. */
+  if (is_stop)
+    gst_inter_pipe_src_discard_flushed (src);
+
+  return ret;
+}
+
 static gboolean
 gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
     guint64 basetime)
@@ -1255,6 +1287,10 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
 
   if (!src->accept_events)
     goto no_events;
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_START
+      || GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP)
+    return gst_inter_pipe_src_forward_flush (src, event);
 
   if (!GST_EVENT_IS_SERIALIZED (event)) {
 
