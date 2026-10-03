@@ -31,6 +31,7 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_cold_attach \
                  gst/test_force_key_unit_event \
                  gst/test_stream_sync \
+                 gst/test_stream_sync_retiming \
                  gst/test_get_caps \
                  gst/test_hot_plug \
                  gst/test_in_bounds_events \
@@ -38,7 +39,11 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_node_name_removed \
                  gst/test_out_of_bounds_events \
                  gst/test_out_of_bounds_upstream_events \
+                 gst/test_preroll_forwarding \
+                 gst/test_producer_latency \
                  gst/test_reconfigure_event \
+                 gst/test_segment_forwarding \
+                 gst/test_serial_event_order \
                  gst/test_set_caps \
                  gst/test_videocrop_format
 
