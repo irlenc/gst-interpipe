@@ -151,43 +151,46 @@ GST_START_TEST (reconfigure_event)
    * Verifies if interpipesink and interpipesrc have caps set
    * Reconfigure event is omited when an interpipe sink has two listeners,
    * that's why sources have to listen to NULL first.
-   *
-   * Clear the flag before triggering the relisten. set_caps emits notify::caps
-   * synchronously on this thread, so clearing it afterwards would discard the
-   * very signal being waited for and stall until the timeout. Holding the mutex
-   * across g_object_set is not an option either: it would deadlock against the
-   * notify handler.
    */
-  g_mutex_lock (&mutex);
-  capschange = FALSE;
-  g_mutex_unlock (&mutex);
-
   g_object_set (G_OBJECT (intersrc1), "listen-to", NULL, NULL);
   g_object_set (G_OBJECT (intersrc2), "listen-to", NULL, NULL);
   g_object_set (G_OBJECT (intersrc1), "listen-to", "intersink2", NULL);
   g_object_set (G_OBJECT (intersrc2), "listen-to", "intersink1", NULL);
 
-  /* wait for the caps signal */
-  g_mutex_lock (&mutex);
+  /*
+   * Wait until intersrc1 carries intersink2's caps. The relisten takes more
+   * than one caps change: intersrc1 first takes intersink2's current caps,
+   * then sink2 renegotiates for its new listener's narrower range. Any of
+   * those wakes the wait, so the caps are compared after every wake, and
+   * every 50 ms in case a change landed before the wait began.
+   */
   end_time = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
-  while (!capschange) {
-    if (!g_cond_wait_until (&cond, &mutex, end_time)) {
-      /* Timed out. g_cond_wait_until returns with the mutex still held, so
-       * break and let the single unlock below release it. Unlocking here and
-       * looping would re-enter g_cond_wait_until on an unlocked mutex, which
-       * aborts with "unlock mutex that was not locked". */
+  caps1 = NULL;
+  caps2 = NULL;
+  while (TRUE) {
+    gint64 next;
+
+    gst_caps_replace (&caps1, NULL);
+    gst_caps_replace (&caps2, NULL);
+    caps2 = gst_app_src_get_caps (GST_APP_SRC (intersrc1));
+    caps1 = gst_app_sink_get_caps (GST_APP_SINK (intersink2));
+    if (caps1 && caps2 && gst_caps_is_equal (caps1, caps2))
       break;
-    }
+    if (g_get_monotonic_time () >= end_time)
+      break;
+
+    next = MIN (end_time,
+        g_get_monotonic_time () + 50 * G_TIME_SPAN_MILLISECOND);
+    g_mutex_lock (&mutex);
+    g_cond_wait_until (&cond, &mutex, next);
+    g_mutex_unlock (&mutex);
   }
-  g_mutex_unlock (&mutex);
 
-  caps2 = gst_app_src_get_caps (GST_APP_SRC (intersrc1));
   fail_if (!caps2);
-
-  caps1 = gst_app_sink_get_caps (GST_APP_SINK (intersink2));
   fail_if (!caps1);
-
   fail_if (!gst_caps_is_equal (caps1, caps2));
+  gst_caps_unref (caps1);
+  gst_caps_unref (caps2);
 
   /* Stop pipelines */
   g_signal_handler_disconnect (pad, id);
